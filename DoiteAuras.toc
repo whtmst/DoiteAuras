@@ -2,10 +2,12 @@
 ## Title: |cff33ff99[DoiteAuras]|r
 ## Notes: Simplified WeakAura-style addon
 ## Author: Doite
-## Version: 0.1
+## Version: 1.0.0
 ## SavedVariablesPerCharacter: DoiteAurasDB
 
 DoiteAuras.lua
 
 Modules\DoiteEdit.lua
+Modules\DoiteGlow.lua
 Modules\DoiteConditions.lua
+Modules\DoiteGroup.lua

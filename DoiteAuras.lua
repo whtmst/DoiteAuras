@@ -177,6 +177,21 @@ guide:SetText("Guide: Add abilities from your spellbook. Abilities show when usa
 -- storage
 local spellButtons, icons = {}, {}
 
+local function GetIconLayout(key)
+    if DoiteDB and DoiteDB.icons and DoiteDB.icons[key] then
+        return DoiteDB.icons[key]
+    end
+    return nil
+end
+
+-- helper to get data (safe init)
+local function GetSpellData(key)
+  if not DoiteAurasDB.spells[key] then
+    DoiteAurasDB.spells[key] = {}
+  end
+  return DoiteAurasDB.spells[key]
+end
+
 -- Helpers
 local function GetOrderedSpells()
     local list = {}
@@ -229,45 +244,98 @@ local function FindPlayerDebuff(name)
     return false,nil
 end
 
--- Create/update icon
+-- Create/update icon (fixed: use offsetX/offsetY/iconSize saved fields and create global DoiteIcon_<key> frames)
 local function CreateOrUpdateIcon(key, layer)
-    local data = DoiteAurasDB.spells[key]; if not data then return end
-    local name, typ = data.displayName or "", data.type or "Ability"
+    local data = GetSpellData(key)
+    local name, typ = data.displayName or data.name or "", data.type or "Ability"
     local show, tex = false, nil
 
+    -- Base visibility logic (unchanged)
     if typ=="Ability" then
         local slot = FindSpellBookSlot(name)
         if slot then
             local start, dur, en = GetSpellCooldown(slot, BOOKTYPE_SPELL)
             if en==1 and (dur==0 or dur==nil) then
-                tex = GetSpellTexture(slot, BOOKTYPE_SPELL); show=true
+                tex = GetSpellTexture(slot, BOOKTYPE_SPELL)
+                show = true
             end
         end
     elseif typ=="Buff" then
-        local found,btex = FindPlayerBuff(name); if found then show=true; tex=btex end
+        local found, btex = FindPlayerBuff(name)
+        if found then show = true; tex = btex end
     elseif typ=="Debuff" then
-        local found,dtex = FindPlayerDebuff(name); if found then show=true; tex=dtex end
+        local found, dtex = FindPlayerDebuff(name)
+        if found then show = true; tex = dtex end
     end
 
-    if not icons[key] then
-        local f=CreateFrame("Frame",nil,UIParent)
-        f:SetWidth(36); f:SetHeight(36); f:EnableMouse(true); f:SetMovable(true)
+    -- Create or reuse a *named* global frame so DoiteConditions can find it
+    local globalName = "DoiteIcon_" .. key
+    local f = _G[globalName]
+    if not f then
+        f = CreateFrame("Frame", globalName, UIParent)
+        f:SetFrameStrata("MEDIUM")
+        f:EnableMouse(true)
+        f:SetMovable(true)
         f:RegisterForDrag("LeftButton")
-        f:SetScript("OnDragStart",function() this:StartMoving() end)
-        f:SetScript("OnDragStop",function()
-            this:StopMovingOrSizing()
-            local _,_,_,x,y=this:GetPoint(); data.x=x or 0; data.y=y or 0
+        -- icon texture
+        f.icon = f:CreateTexture(nil, "BACKGROUND")
+        f.icon:SetAllPoints(f)
+
+        -- drag handlers save into the DB fields used by DoiteEdit (offsetX/offsetY)
+        f:SetScript("OnDragStart", function(self) self:StartMoving() end)
+        f:SetScript("OnDragStop", function(self)
+            self:StopMovingOrSizing()
+            local point, relTo, relPoint, x, y = self:GetPoint()
+            -- Save to DoiteAurasDB.spells fields that DoiteEdit expects
+            data.offsetX = x or 0
+            data.offsetY = y or 0
+            -- update immediately (if DoiteAuras refresh function exists)
+            if DoiteAuras_RefreshIcons then pcall(DoiteAuras_RefreshIcons) end
         end)
-        f.icon=f:CreateTexture(nil,"BACKGROUND"); f.icon:SetAllPoints(f)
-        icons[key]=f
     end
 
-    local f=icons[key]; if layer then f:SetFrameLevel(layer) end
+    -- cache locally as before so list code can still hide/show if it wants
+    icons[key] = f
+
+    if layer then f:SetFrameLevel(layer) end
+
+    -- Apply layout data (prefer spell's own saved offset/iconSize, but remain compatible with DoiteDB.icons if present)
+    local layout = GetIconLayout(key) -- still okay to prefer DoiteDB.icons if present (backwards compatibility)
+
+    -- primary source: DoiteAurasDB.spells data fields (offsetX/offsetY/iconSize)
+    local posX = data.offsetX or data.x or 0
+    local posY = data.offsetY or data.y or 0
+    local size = data.iconSize or data.size or 36
+
+    -- if DoiteDB layout exists, allow it to override (preserve compatibility)
+    if layout then
+        posX = layout.posX or layout.offsetX or posX
+        posY = layout.posY or layout.offsetY or posY
+        size = layout.size or layout.iconSize or size
+    end
+
+    -- Apply transform/size/point
+    f:SetScale(data.scale or 1)
+    f:SetAlpha(data.alpha or 1)
+    f:ClearAllPoints()
+    f:SetWidth(size)
+    f:SetHeight(size)
+    f:SetPoint("CENTER", UIParent, "CENTER", posX, posY)
+
+    -- Optional condition function from DB (unchanged)
+    if data.conditionFunc and type(data.conditionFunc) == "function" then
+        show = data.conditionFunc(show, name, typ, data)
+    end
+
+    -- Update texture and visibility
     if show then
         f.icon:SetTexture(tex or "Interface\\Icons\\INV_Misc_QuestionMark")
-        f:Show(); f:ClearAllPoints(); f:SetPoint("CENTER",UIParent,"CENTER",data.x or 0,data.y or 0)
-    else f:Hide() end
+        f:Show()
+    else
+        f:Hide()
+    end
 end
+
 
 -- Refresh icons
 local function RefreshIcons()
@@ -359,10 +427,14 @@ addBtn:SetScript("OnClick",function()
     if t=="Ability" and not FindSpellBookSlot(name) then
         DEFAULT_CHAT_FRAME:AddMessage("|cffff0000DoiteAuras:|r Spell not found in spellbook."); return
     end
-    if not DoiteAurasDB.spells[key] then
-        local nextOrder=table.getn(GetOrderedSpells())+1
-        DoiteAurasDB.spells[key]={order=nextOrder,type=t,displayName=name}
-    end
+	if not DoiteAurasDB.spells[key] then
+		local nextOrder=table.getn(GetOrderedSpells())+1
+		DoiteAurasDB.spells[key]={order=nextOrder,type=t,displayName=name}
+		-- if DoiteEdit (EnsureDBEntry) is loaded, make sure defaults are applied immediately
+		if EnsureDBEntry then
+			pcall(EnsureDBEntry, key)
+		end
+	end
     input:SetText(""); RebuildOrder(); RefreshList(); RefreshIcons()
     scrollFrame:SetVerticalScroll(math.max(0,listContent:GetHeight()-scrollFrame:GetHeight()))
 end)
@@ -372,7 +444,17 @@ SLASH_DOITEAURAS1="/da"
 SlashCmdList["DOITEAURAS"]=function() if frame:IsShown() then frame:Hide() else frame:Show(); RefreshList() end end
 
 -- Update icons frequently
-local updateFrame=CreateFrame("Frame")
-updateFrame:SetScript("OnUpdate",function() RefreshIcons() end)
+local updateFrame = CreateFrame("Frame")
+updateFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
+updateFrame:RegisterEvent("UNIT_AURA")
+updateFrame:RegisterEvent("SPELL_UPDATE_COOLDOWN")
+updateFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
+updateFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
+updateFrame:SetScript("OnEvent", function()
+    RefreshIcons()
+end)
 
 RebuildOrder(); RefreshList(); RefreshIcons()
+
+DoiteAuras_RefreshList  = RefreshList
+DoiteAuras_RefreshIcons = RefreshIcons
