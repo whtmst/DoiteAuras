@@ -6,10 +6,10 @@
 
 if DoiteAurasFrame then return end
 
--- SavedVariables init
-if not DoiteAurasDB then
-    DoiteAurasDB = { spells = {}, settings = { growth = "HORIZONTAL", spacing = 8 } }
-end
+-- SavedVariables init (guarded; do NOT clobber existing data)
+DoiteAurasDB = DoiteAurasDB or {}
+DoiteAurasDB.spells   = DoiteAurasDB.spells   or {}
+DoiteAurasDB.cache = DoiteAurasDB.cache or {}
 
 -- Title-case function with exceptions for small words (keeps first word capitalized)
 local function TitleCase(str)
@@ -57,7 +57,7 @@ end
 -- Main frame (layout & sizes)
 local frame = CreateFrame("Frame", "DoiteAurasFrame", UIParent)
 frame:SetWidth(355)
-frame:SetHeight(360)
+frame:SetHeight(450)
 frame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
 frame:EnableMouse(true)
 frame:SetMovable(true)
@@ -108,24 +108,33 @@ local abilityCB, buffCB, debuffCB
 
 abilityCB = CreateFrame("CheckButton", nil, frame, "UICheckButtonTemplate")
 abilityCB:SetWidth(20); abilityCB:SetHeight(20)
-abilityCB:SetPoint("TOPLEFT", input, "BOTTOMLEFT", 0, -6)
+abilityCB:SetPoint("TOPLEFT", input, "BOTTOMLEFT", 0, -3)
 abilityCB.text = abilityCB:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 abilityCB.text:SetPoint("LEFT", abilityCB, "RIGHT", 2, 0)
 abilityCB.text:SetText("Abilities")
 
 buffCB = CreateFrame("CheckButton", nil, frame, "UICheckButtonTemplate")
 buffCB:SetWidth(20); buffCB:SetHeight(20)
-buffCB:SetPoint("TOPLEFT", input, "BOTTOMLEFT", 90, -6)
+buffCB:SetPoint("TOPLEFT", input, "BOTTOMLEFT", 65, -3)
 buffCB.text = buffCB:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 buffCB.text:SetPoint("LEFT", buffCB, "RIGHT", 2, 0)
 buffCB.text:SetText("Buffs")
 
 debuffCB = CreateFrame("CheckButton", nil, frame, "UICheckButtonTemplate")
 debuffCB:SetWidth(20); debuffCB:SetHeight(20)
-debuffCB:SetPoint("TOPLEFT", input, "BOTTOMLEFT", 170, -6)
+debuffCB:SetPoint("TOPLEFT", input, "BOTTOMLEFT", 120, -3)
 debuffCB.text = debuffCB:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 debuffCB.text:SetPoint("LEFT", debuffCB, "RIGHT", 2, 0)
 debuffCB.text:SetText("Debuffs")
+
+-- Disabled "Items" checkbox (coming soon)
+local itemsCB = CreateFrame("CheckButton", nil, frame, "UICheckButtonTemplate")
+itemsCB:SetWidth(20); itemsCB:SetHeight(20)
+itemsCB:SetPoint("TOPLEFT", input, "BOTTOMLEFT", 185, -3)
+itemsCB:Disable()  -- greys it out
+itemsCB.text = itemsCB:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+itemsCB.text:SetPoint("LEFT", itemsCB, "RIGHT", 2, 0)
+itemsCB.text:SetText("|cffA0A0A0Items (Coming soon)|r")
 
 abilityCB:SetScript("OnClick", function()
     abilityCB:SetChecked(true); buffCB:SetChecked(false); debuffCB:SetChecked(false)
@@ -148,8 +157,8 @@ end)
 -- Scrollable container
 local listContainer = CreateFrame("Frame", nil, frame)
 listContainer:SetWidth(300)
-listContainer:SetHeight(170)
-listContainer:SetPoint("TOPLEFT", input, "BOTTOMLEFT", -5, -30)
+listContainer:SetHeight(260)
+listContainer:SetPoint("TOPLEFT", input, "BOTTOMLEFT", -5, -25)
 listContainer:SetBackdrop({
     bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
     edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
@@ -158,21 +167,21 @@ listContainer:SetBackdropColor(0,0,0,0.7)
 
 local scrollFrame = CreateFrame("ScrollFrame", "DoiteAurasScroll", listContainer, "UIPanelScrollFrameTemplate")
 scrollFrame:SetWidth(280)
-scrollFrame:SetHeight(160)
+scrollFrame:SetHeight(250)
 scrollFrame:SetPoint("TOPLEFT", listContainer, "TOPLEFT", 15, -5)
 
 local listContent = CreateFrame("Frame", "DoiteAurasListContent", scrollFrame)
 listContent:SetWidth(280)
-listContent:SetHeight(160)
+listContent:SetHeight(250)
 scrollFrame:SetScrollChild(listContent)
 
 -- Guide text
 local guide = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-guide:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 20, 45)
+guide:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 20, 20)
 guide:SetWidth(315)
 guide:SetJustifyH("LEFT")
 if guide.SetTextColor then guide:SetTextColor(0.7,0.7,0.7) end
-guide:SetText("Guide: Add abilities from your spellbook. Abilities show when usable/off CD. Buffs/Debuffs show when on player. Reorder with arrows.")
+guide:SetText("Guide: DoiteAuras lets you show abilities, buffs, and debuffs only when you need them. Add an icon, choose type (Ability, Buff, Debuff), set priority and conditions. Use Usable/Not on CD for abilities, or Found/Missing for auras. Pick combat state (in/out), target (self/help/harm), visuals (glow/grey) and more. Aura icons save automatically and cache textures once seen.")
 
 -- storage
 local spellButtons, icons = {}, {}
@@ -246,6 +255,30 @@ end
 
 -- Create/update icon (fixed: use offsetX/offsetY/iconSize saved fields and create global DoiteIcon_<key> frames)
 local function CreateOrUpdateIcon(key, layer)
+  -- One-time creation guard: build UI objects once, then only update properties
+  local name = "DoiteIcon_" .. key
+  local f = _G[name]
+  if not f then
+    f = CreateFrame("Frame", name, UIParent)
+    f:SetWidth(size or 36)
+    f:SetHeight(size or 36)
+    f:SetPoint("CENTER", UIParent, "CENTER")  -- hidden by default; Conditions controls visibility
+
+    -- Create children exactly once
+    local icon = f:CreateTexture(nil, "ARTWORK")
+    icon:SetAllPoints(f)
+    f.icon = icon
+
+    -- Optional count text (created once)
+    local fs = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    fs:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -2, 2)
+    fs:SetText("")
+    f.count = fs
+  end
+
+  -- From here on, ONLY update properties (no Show/Hide here)
+  -- Texture update: set only if available/changed
+  if tex and f.icon then f.icon:SetTexture(tex) end
     local data = GetSpellData(key)
     local name, typ = data.displayName or data.name or "", data.type or "Ability"
     local show, tex = false, nil
@@ -330,9 +363,7 @@ local function CreateOrUpdateIcon(key, layer)
     -- Update texture and visibility
     if show then
         f.icon:SetTexture(tex or "Interface\\Icons\\INV_Misc_QuestionMark")
-        f:Show()
     else
-        f:Hide()
     end
 end
 
@@ -366,7 +397,8 @@ local function RefreshList()
             DoiteAurasDB.spells[key]=nil; if icons[key] then icons[key]:Hide(); icons[key]=nil end
             if spellButtons[key] and spellButtons[key].Hide then spellButtons[key]:Hide() end
             RebuildOrder(); RefreshList(); RefreshIcons()
-        end)
+            if DoiteConditions_RequestEvaluate then DoiteConditions_RequestEvaluate() end
+		end)
         -- Edit
         btn.editBtn=CreateFrame("Button",nil,btn,"UIPanelButtonTemplate")
         btn.editBtn:SetWidth(50); btn.editBtn:SetHeight(18)
@@ -399,7 +431,8 @@ local function RefreshList()
                 local above=ord[j-1].key; local tmp=DoiteAurasDB.spells[key].order
                 DoiteAurasDB.spells[key].order=DoiteAurasDB.spells[above].order; DoiteAurasDB.spells[above].order=tmp
                 RebuildOrder(); RefreshList(); RefreshIcons(); break end end
-        end)
+            if DoiteConditions_RequestEvaluate then DoiteConditions_RequestEvaluate() end
+		end)
         btn.upBtn=CreateFrame("Button",nil,btn); btn.upBtn:SetWidth(18); btn.upBtn:SetHeight(18)
         btn.upBtn:SetNormalTexture("Interface\\MainMenuBar\\UI-MainMenu-ScrollDownButton-Up")
         btn.upBtn:SetPushedTexture("Interface\\MainMenuBar\\UI-MainMenu-ScrollDownButton-Down")
@@ -410,7 +443,8 @@ local function RefreshList()
                 local below=ord[j+1].key; local tmp=DoiteAurasDB.spells[key].order
                 DoiteAurasDB.spells[key].order=DoiteAurasDB.spells[below].order; DoiteAurasDB.spells[below].order=tmp
                 RebuildOrder(); RefreshList(); RefreshIcons(); break end end
-        end)
+			if DoiteConditions_RequestEvaluate then DoiteConditions_RequestEvaluate() end
+		end)
         btn.sep=btn:CreateTexture(nil,"ARTWORK"); btn.sep:SetHeight(1)
         btn.sep:SetPoint("BOTTOMLEFT",btn,"BOTTOMLEFT",0,-2)
         btn.sep:SetPoint("BOTTOMRIGHT",btn,"BOTTOMRIGHT",0,-2); btn.sep:SetTexture(0.9,0.9,0.9,0.12)
@@ -437,24 +471,319 @@ addBtn:SetScript("OnClick",function()
 	end
     input:SetText(""); RebuildOrder(); RefreshList(); RefreshIcons()
     scrollFrame:SetVerticalScroll(math.max(0,listContent:GetHeight()-scrollFrame:GetHeight()))
+	if DoiteConditions_RequestEvaluate then DoiteConditions_RequestEvaluate() end
+end)
+
+-- =========================
+-- Minimap Button (DoiteAuras)
+-- =========================
+local function DA_GetVersion()
+  local v = (GetAddOnMetadata and GetAddOnMetadata("DoiteAuras", "Version")) or (DoiteAuras_Version) or "?"
+  return v or "?"
+end
+
+local function _DA_MiniSV()
+  DoiteAurasDB.minimap = DoiteAurasDB.minimap or {}
+  if DoiteAurasDB.minimap.angle == nil then DoiteAurasDB.minimap.angle = 45 end -- default angle
+  return DoiteAurasDB.minimap
+end
+
+local function _DA_PlaceMini(btn)
+  local ang = ((_DA_MiniSV().angle or 45) * math.pi / 180)
+  local x = math.cos(ang) * 80
+  local y = math.sin(ang) * 80
+  btn:SetPoint("CENTER", Minimap, "CENTER", x, y)
+end
+
+local function DA_CreateMinimapButton()
+  if _G["DoiteAurasMinimapButton"] then return end
+
+  local btn = CreateFrame("Button", "DoiteAurasMinimapButton", Minimap)
+  btn:SetFrameStrata("MEDIUM")
+  btn:SetWidth(31); btn:SetHeight(31)
+
+  -- Ring overlay
+  local overlay = btn:CreateTexture(nil, "OVERLAY")
+  overlay:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
+  overlay:SetWidth(54); overlay:SetHeight(54)
+  overlay:SetPoint("TOPLEFT", 0, 0)
+
+  -- Icon (your DA tga)
+  local icon = btn:CreateTexture(nil, "BACKGROUND")
+  icon:SetTexture("Interface\\AddOns\\DoiteAuras\\Textures\\doiteauras-icon")
+  icon:SetTexCoord(0.05, 0.95, 0.05, 0.95)
+  icon:SetWidth(20); icon:SetHeight(20)
+  icon:SetPoint("TOPLEFT", 6, -5)
+
+  local hlt = btn:CreateTexture(nil, "HIGHLIGHT")
+  hlt:SetTexture("Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight")
+  hlt:SetBlendMode("ADD")
+  hlt:SetAllPoints(btn)
+
+  btn:RegisterForDrag("LeftButton", "RightButton")
+  btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+
+  -- drag to move along the minimap ring
+  btn:SetScript("OnDragStart", function()
+    btn:SetScript("OnUpdate", function()
+      local x, y = GetCursorPosition()
+      local mx, my = Minimap:GetCenter()
+      local scale = Minimap:GetEffectiveScale()
+      local ang = math.deg(math.atan2(y/scale - my, x/scale - mx))
+      _DA_MiniSV().angle = ang
+      _DA_PlaceMini(btn)
+    end)
+  end)
+  btn:SetScript("OnDragStop", function() btn:SetScript("OnUpdate", nil) end)
+
+  -- click: opens/close DoiteAuras
+  btn:SetScript("OnClick", function()
+    if DoiteAurasFrame and DoiteAurasFrame:IsShown() then
+      DoiteAurasFrame:Hide()
+    else
+	-- center-on-open logic (keeps your Step #1 behavior)
+    if DoiteAurasFrame then
+     DoiteAurasFrame:ClearAllPoints()
+     DoiteAurasFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+     DoiteAurasFrame:Show()
+		end
+	end
+  end)
+
+  -- tooltip
+  btn:SetScript("OnEnter", function()
+    GameTooltip:SetOwner(btn, "ANCHOR_LEFT")
+    GameTooltip:AddLine("DOITEAURAS", 0.435, 0.659, 0.863) -- #6FA8DC
+    GameTooltip:AddLine("Click to open DoiteAuras", 1, 1, 1)
+    GameTooltip:AddLine("Version: " .. tostring(DA_GetVersion()), 0.9, 0.9, 0.9)
+    GameTooltip:Show()
+  end)
+  btn:SetScript("OnLeave", function()
+    if GameTooltip:IsOwned(btn) then GameTooltip:Hide() end
+  end)
+
+  -- initial placement
+  _DA_PlaceMini(btn)
+end
+
+-- create/show on load
+local _daMiniInit = CreateFrame("Frame")
+_daMiniInit:RegisterEvent("ADDON_LOADED")
+_daMiniInit:SetScript("OnEvent", function()
+  if event ~= "ADDON_LOADED" or arg1 ~= "DoiteAuras" then return end
+  DA_CreateMinimapButton()
 end)
 
 -- Slash
 SLASH_DOITEAURAS1="/da"
-SlashCmdList["DOITEAURAS"]=function() if frame:IsShown() then frame:Hide() else frame:Show(); RefreshList() end end
+SLASH_DOITEAURAS2="/doiteauras"
+SLASH_DOITEAURAS3="/doiteaura"
+SLASH_DOITEAURAS4="/doite"
+SlashCmdList["DOITEAURAS"] = function()
+  if frame:IsShown() then
+    frame:Hide()
+  else
+    -- Always (re)center on open
+    frame:ClearAllPoints()
+    frame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+    frame:Show()
+    RefreshList()
+  end
+end
+
+-- =========================
+-- Version WHO (/daversionwho)
+-- =========================
+local DA_PREFIX = "DOITEAURAS"
+
+local function DA_GetVersion_Safe()
+  -- Reuse your existing DA_GetVersion() if present (minimap section defines it)
+  if type(DA_GetVersion) == "function" then
+    return DA_GetVersion() or "?"
+  end
+  local v = (GetAddOnMetadata and GetAddOnMetadata("DoiteAuras", "Version")) or (DoiteAuras_Version) or "?"
+  return v or "?"
+end
+
+-- Broadcast helpers
+local function DA_BroadcastVersion(channel)
+  if not SendAddonMessage then return end
+  SendAddonMessage(DA_PREFIX, "DA_VER:" .. tostring(DA_GetVersion_Safe()), channel)
+end
+
+local function DA_BroadcastVersionAll()
+  if not SendAddonMessage then return end
+  if UnitInRaid and UnitInRaid("player") then
+    SendAddonMessage(DA_PREFIX, "DA_VER:" .. tostring(DA_GetVersion_Safe()), "RAID")
+  elseif GetNumPartyMembers and GetNumPartyMembers() > 0 then
+    SendAddonMessage(DA_PREFIX, "DA_VER:" .. tostring(DA_GetVersion_Safe()), "PARTY")
+  elseif IsInGuild and IsInGuild() then
+    SendAddonMessage(DA_PREFIX, "DA_VER:" .. tostring(DA_GetVersion_Safe()), "GUILD")
+  end
+end
+
+-- Version compare helpers
+local function DA_ParseVersion(v)
+  local a,b,c = string.match(tostring(v or ""), "^(%d+)%.(%d+)%.?(%d*)$")
+  return tonumber(a) or 0, tonumber(b) or 0, tonumber(c) or 0
+end
+local function DA_IsNewer(v1, v2)
+  local a1,b1,c1 = DA_ParseVersion(v1)
+  local a2,b2,c2 = DA_ParseVersion(v2)
+  if a1 ~= a2 then return a1 > a2 end
+  if b1 ~= b2 then return b1 > b2 end
+  return c1 > c2
+end
+local _daVerNotifiedOnce = false
+local _daVerLastEcho = 0
+
+-- /daversionwho: ask others to report their version
+SLASH_DAVERSIONWHO1 = "/daversionwho"
+SlashCmdList["DAVERSIONWHO"] = function()
+  local cf = (DEFAULT_CHAT_FRAME or ChatFrame1)
+  if cf then cf:AddMessage("|cff6FA8DCDoiteAuras:|r version WHO sent. Listening for replies...") end
+  local sent = false
+  if UnitInRaid and UnitInRaid("player") then
+    SendAddonMessage(DA_PREFIX, "DA_WHO", "RAID");  sent = true
+  elseif GetNumPartyMembers and GetNumPartyMembers() > 0 then
+    SendAddonMessage(DA_PREFIX, "DA_WHO", "PARTY"); sent = true
+  elseif IsInGuild and IsInGuild() then
+    SendAddonMessage(DA_PREFIX, "DA_WHO", "GUILD"); sent = true
+  end
+  if not sent and cf then
+    cf:AddMessage("|cff6FA8DCDoiteAuras:|r No channels available (raid/party/guild).")
+  end
+end
+
+-- Small delayed runner (Vanilla/Turtle: use arg1 in OnUpdate)
+local function DA_RunLater(delay, func)
+  local f = CreateFrame("Frame")
+  local acc = 0
+  f:SetScript("OnUpdate", function()
+    acc = acc + arg1
+    if acc >= delay then
+      f:SetScript("OnUpdate", nil)
+      if type(func) == "function" then pcall(func) end
+    end
+  end)
+end
+
+-- Version event listener (compare, notify, echo replies)
+local _daVer = CreateFrame("Frame")
+_daVer:RegisterEvent("CHAT_MSG_ADDON")
+_daVer:SetScript("OnEvent", function()
+  if event ~= "CHAT_MSG_ADDON" then return end
+  local prefix, text, channel, sender = arg1, arg2, arg3, arg4
+  if prefix ~= DA_PREFIX or type(text) ~= "string" then return end
+
+  local mine = tostring(DA_GetVersion_Safe())
+  local cf   = (DEFAULT_CHAT_FRAME or ChatFrame1)
+
+  if text == "DA_WHO" then
+    -- someone asked; tell them our version back on the same channel
+    if channel and SendAddonMessage then
+      SendAddonMessage(DA_PREFIX, "DA_ME:" .. mine, channel)
+    end
+    return
+  end
+
+  if string.sub(text, 1, 6) == "DA_ME:" then
+    local other = string.sub(text, 7)
+    -- show who has what (your existing behavior)
+    if cf then
+      cf:AddMessage(string.format("|cff6FA8DCDoiteAuras:|r %s has %s (you: %s)", tostring(sender or "?"), tostring(other or "?"), tostring(mine)))
+    end
+    -- notify once if theirs is newer than mine
+    if (not _daVerNotifiedOnce) and DA_IsNewer(other, mine) then
+      _daVerNotifiedOnce = true
+      DA_RunLater(8, function()
+        if cf then
+          cf:AddMessage(string.format("|cff6FA8DCDoiteAuras:|r A newer version is available (yours: %s, latest seen: %s). Consider updating.", tostring(mine), tostring(other)))
+        end
+      end)
+    end
+    return
+  end
+
+  if string.sub(text, 1, 7) == "DA_VER:" then
+    local other = string.sub(text, 8)
+    -- notify once if theirs is newer than mine
+    if (not _daVerNotifiedOnce) and DA_IsNewer(other, mine) then
+      _daVerNotifiedOnce = true
+      DA_RunLater(8, function()
+        if cf then
+          cf:AddMessage(string.format("|cff6FA8DCDoiteAuras:|r A newer version is available (yours: %s, latest seen: %s). Consider updating.", tostring(mine), tostring(other)))
+        end
+      end)
+    end
+    -- echo mine back (rate-limited) so others see my version too
+    if channel and SendAddonMessage then
+      local now = (GetTime and GetTime()) or 0
+      if now - _daVerLastEcho > 10 then
+        _daVerLastEcho = now
+        SendAddonMessage(DA_PREFIX, "DA_VER:" .. mine, channel)
+      end
+    end
+    return
+  end
+end)
+
+
+-- Loaded message + delayed version broadcast(s)
+local _daRaidAnnounced = false
+
+local _daLoad = CreateFrame("Frame")
+_daLoad:RegisterEvent("ADDON_LOADED")
+_daLoad:RegisterEvent("PLAYER_ENTERING_WORLD")
+_daLoad:RegisterEvent("RAID_ROSTER_UPDATE")
+
+_daLoad:SetScript("OnEvent", function()
+  if event == "ADDON_LOADED" and arg1 == "DoiteAuras" then
+    -- 1s after load: print “loaded” line with version
+    DA_RunLater(1, function()
+      local v  = tostring(DA_GetVersion_Safe())
+      local cf = (DEFAULT_CHAT_FRAME or ChatFrame1)
+      if cf then
+        cf:AddMessage("|cff6FA8DCDoiteAuras|r v"..v.." loaded. Use |cffffff00/da|r (or minimap icon).")
+      end
+    end)
+
+  elseif event == "PLAYER_ENTERING_WORLD" then
+    -- 10s after entering world: broadcast my version to an available channel
+    DA_RunLater(10, function()
+      DA_BroadcastVersionAll()
+    end)
+
+  elseif event == "RAID_ROSTER_UPDATE" then
+    -- first time you are in a raid: announce on RAID after ~3s
+    if not _daRaidAnnounced and UnitInRaid and UnitInRaid("player") then
+      _daRaidAnnounced = true
+      DA_RunLater(3, function()
+        if SendAddonMessage then
+          SendAddonMessage("DOITEAURAS", "DA_VER:"..tostring(DA_GetVersion_Safe()), "RAID")
+        end
+      end)
+    end
+  end
+end)
 
 -- Update icons frequently
 local updateFrame = CreateFrame("Frame")
 updateFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
-updateFrame:RegisterEvent("UNIT_AURA")
-updateFrame:RegisterEvent("SPELL_UPDATE_COOLDOWN")
-updateFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
-updateFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
 updateFrame:SetScript("OnEvent", function()
-    RefreshIcons()
+  if event == "PLAYER_ENTERING_WORLD" then RefreshIcons() end
 end)
 
 RebuildOrder(); RefreshList(); RefreshIcons()
 
 DoiteAuras_RefreshList  = RefreshList
 DoiteAuras_RefreshIcons = RefreshIcons
+
+
+-- Ensure an icon frame exists for a given key (no visibility changes)
+function DoiteAuras_TouchIcon(key)
+  if not key then return end
+  local name = "DoiteIcon_"..key
+  if _G[name] then return end
+  if CreateOrUpdateIcon then CreateOrUpdateIcon(key, 36) end
+end

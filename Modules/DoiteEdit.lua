@@ -45,13 +45,28 @@ local function EnsureDBEntry(key)
         if d.conditions.ability.mode   == nil then d.conditions.ability.mode   = "notcd" end
         if d.conditions.ability.inCombat  == nil then d.conditions.ability.inCombat  = true end
         if d.conditions.ability.outCombat == nil then d.conditions.ability.outCombat = true end
-        if d.conditions.ability.target  == nil then d.conditions.ability.target  = "all"   end
+				-- multi-select targets (at least one should be true)
+		if d.conditions.ability.targetHelp == nil then d.conditions.ability.targetHelp = false end
+		if d.conditions.ability.targetHarm == nil then d.conditions.ability.targetHarm = false end
+		if d.conditions.ability.targetSelf == nil then d.conditions.ability.targetSelf = false end
+		-- legacy cleanup
+		d.conditions.ability.target = nil
         if d.conditions.ability.form    == nil then d.conditions.ability.form    = "All"   end
     else -- Buff / Debuff
         if d.conditions.aura.mode   == nil then d.conditions.aura.mode   = "found" end
         if d.conditions.aura.inCombat  == nil then d.conditions.aura.inCombat  = true end
         if d.conditions.aura.outCombat == nil then d.conditions.aura.outCombat = true end
-        if d.conditions.aura.target  == nil then d.conditions.aura.target  = "self"  end
+		-- Aura targets: self-exclusive model (default = On player (self))
+		if d.conditions.aura.targetSelf == nil then d.conditions.aura.targetSelf = true  end
+		if d.conditions.aura.targetHelp == nil then d.conditions.aura.targetHelp = false end
+		if d.conditions.aura.targetHarm == nil then d.conditions.aura.targetHarm = false end
+
+		-- legacy cleanup (if still present)
+		d.conditions.aura.target = nil
+		d.conditions.aura.targetSelf = d.conditions.aura.targetSelf -- keep; old flag name reused
+		d.conditions.aura.targetTarget = nil
+
+		
         if d.conditions.aura.form    == nil then d.conditions.aura.form    = "All"   end
     end
 
@@ -82,9 +97,11 @@ local function BuildGroupLeaders()
 end
 
 local function SafeEvaluate()
-    if DoiteConditions and DoiteConditions.EvaluateAll then
-        DoiteConditions:EvaluateAll()
-    end
+  if DoiteConditions_RequestEvaluate then
+    DoiteConditions_RequestEvaluate()
+  elseif DoiteConditions and DoiteConditions.EvaluateAll then
+    DoiteConditions:EvaluateAll()
+  end
 end
 
 -- refresh hooks for main addon
@@ -228,22 +245,26 @@ local function InitFormDropdown(dd, data, condType)
         return
     end
 
-    -- Determine player class and build options
+    -- Determine player class and build options (reordered + Priest added)
     local _, class = UnitClass("player")
     class = class and string.upper(class) or ""
 
     local forms = {}
-    if class == "WARRIOR" then
-        forms = {"All", "1. Battle", "2. Berserker", "3. Defensive", "Multi: 1+2", "Multi: 1+3", "Multi: 2+3"}
-    elseif class == "ROGUE" then
-        forms = {"All", "1. Stealth", "2. Not Stealth"}
-    elseif class == "DRUID" then
+    if class == "DRUID" then
         forms = {
-            "All", "1. Noform", "2. Bear", "3. Cat", "4. Aqua", "5. Moonkin",
-            "6. Tree", "7. Travel", "8. Stealth", "9. Not Stealth",
-            "Multi: 1+2", "Multi: 1+3", "Multi: 1+2+3",
-            "Multi: 1+5", "Multi: 1+6", "Multi: 1+5+6"
+            "All",
+            "0. No form", "1. Bear", "2. Aquatic", "3. Cat", "4. Travel",
+            "5. Moonkin", "6. Tree", "7. Stealth", "8. No Stealth",
+            "Multi: 0+5", "Multi: 0+6", "Multi: 1+3", "Multi: 3+7", "Multi: 3+8",
+            "Multi: 5+6", "Multi: 0+5+6", "Multi: 1+3+8"
         }
+    elseif class == "WARRIOR" then
+        forms = { "All", "1. Battle", "2. Defensive", "3. Berserker",
+                  "Multi: 1+2", "Multi: 1+3", "Multi: 2+3" }
+    elseif class == "ROGUE" then
+        forms = { "All", "0. No Stealth", "1. Stealth" }
+    elseif class == "PRIEST" then
+        forms = { "All", "0. No form", "1. Shadowform" }
     else
         dd:Hide()
         return
@@ -419,8 +440,7 @@ local function CreateConditionsUI()
 
     condFrame.cond_ability_target_help = MakeCheck("DoiteCond_Ability_TargetHelp", "Target (help)", 20, row3_y)
     condFrame.cond_ability_target_harm = MakeCheck("DoiteCond_Ability_TargetHarm", "Target (harm)", 120, row3_y)
-    condFrame.cond_ability_target_self = MakeCheck("DoiteCond_Ability_TargetSelf", "Self", 220, row3_y)
-    condFrame.cond_ability_target_all  = MakeCheck("DoiteCond_Ability_TargetAll", "All", 280, row3_y)
+    condFrame.cond_ability_target_self = MakeCheck("DoiteCond_Ability_TargetSelf", "Target (self)", 220, row3_y)
 
     condFrame.cond_ability_glow = MakeCheck("DoiteCond_Ability_Glow", "Glow", 20, row4_y)
     condFrame.cond_ability_power = MakeCheck("DoiteCond_Ability_PowerCB", "Power", 90, row4_y)
@@ -428,12 +448,12 @@ local function CreateConditionsUI()
     condFrame.cond_ability_power_val  = MakeSmallEdit("DoiteCond_Ability_PowerVal", 250, row4_y-2, 40)
     condFrame.cond_ability_power_val_enter = condFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     condFrame.cond_ability_power_val_enter:SetPoint("LEFT", condFrame.cond_ability_power_val, "RIGHT", 4, 0)
-    condFrame.cond_ability_power_val_enter:SetText("(enter)")
+    condFrame.cond_ability_power_val_enter:SetText("(%)")
     condFrame.cond_ability_power_val_enter:Hide()
 
-    condFrame.cond_ability_slider = MakeCheck("DoiteCond_Ability_Slider", "Slider", 90, row5_y)
+    condFrame.cond_ability_slider = MakeCheck("DoiteCond_Ability_Slider", "Soon off CD", 90, row5_y)
     condFrame.cond_ability_slider_dir = CreateFrame("Frame", "DoiteCond_Ability_SliderDir", condFrame, "UIDropDownMenuTemplate")
-    condFrame.cond_ability_slider_dir:SetPoint("TOPLEFT", condFrame, "TOPLEFT", 155, row5_y+3)
+    condFrame.cond_ability_slider_dir:SetPoint("TOPLEFT", condFrame, "TOPLEFT", 170, row5_y+3)
     if UIDropDownMenu_SetWidth then pcall(UIDropDownMenu_SetWidth, 60, condFrame.cond_ability_slider_dir) end
 
     condFrame.cond_ability_remaining_cb   = MakeCheck("DoiteCond_Ability_RemainingCB", "Remaining", 90, row5_y)
@@ -441,7 +461,7 @@ local function CreateConditionsUI()
     condFrame.cond_ability_remaining_val  = MakeSmallEdit("DoiteCond_Ability_RemVal", 250, row5_y-2, 40)
     condFrame.cond_ability_remaining_val_enter = condFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     condFrame.cond_ability_remaining_val_enter:SetPoint("LEFT", condFrame.cond_ability_remaining_val, "RIGHT", 4, 0)
-    condFrame.cond_ability_remaining_val_enter:SetText("(enter)")
+    condFrame.cond_ability_remaining_val_enter:SetText("(sec.)")
     condFrame.cond_ability_remaining_val_enter:Hide()
 
     condFrame.cond_ability_greyscale = MakeCheck("DoiteCond_Ability_Greyscale", "Grey", 20, row5_y)
@@ -459,25 +479,26 @@ local function CreateConditionsUI()
     condFrame.cond_aura_incombat   = MakeCheck("DoiteCond_Aura_InCombat", "In combat", 20, row2_y)
     condFrame.cond_aura_outcombat  = MakeCheck("DoiteCond_Aura_OutCombat", "Out of combat", 110, row2_y)
 
-    condFrame.cond_aura_ontarget = MakeCheck("DoiteCond_Aura_OnTarget", "On target", 20, row3_y)
-    condFrame.cond_aura_onself   = MakeCheck("DoiteCond_Aura_OnSelf", "On self", 120, row3_y)
+	condFrame.cond_aura_target_help = MakeCheck("DoiteCond_Aura_TargetHelp", "Target (help)", 20, row3_y)
+	condFrame.cond_aura_target_harm = MakeCheck("DoiteCond_Aura_TargetHarm", "Target (harm)", 120, row3_y)
+	condFrame.cond_aura_onself      = MakeCheck("DoiteCond_Aura_OnSelf", "On player (self)", 220, row3_y)
 
-    condFrame.cond_aura_glow = MakeCheck("DoiteCond_Aura_Glow", "Glow", 20, row4_y)
-    condFrame.cond_aura_remaining_cb   = MakeCheck("DoiteCond_Aura_RemCB", "Remaining", 90, row4_y)
-    condFrame.cond_aura_remaining_comp = MakeComparatorDD("DoiteCond_Aura_RemComp", 155, row4_y+3, 50)
-    condFrame.cond_aura_remaining_val  = MakeSmallEdit("DoiteCond_Aura_RemVal", 250, row4_y-2, 40)
-    condFrame.cond_aura_remaining_val_enter = condFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    condFrame.cond_aura_remaining_val_enter:SetPoint("LEFT", condFrame.cond_aura_remaining_val, "RIGHT", 4, 0)
-    condFrame.cond_aura_remaining_val_enter:SetText("(enter)")
-    condFrame.cond_aura_remaining_val_enter:Hide()
-
-    condFrame.cond_aura_stacks_cb   = MakeCheck("DoiteCond_Aura_StacksCB", "Stacks", 90, row5_y)
-    condFrame.cond_aura_stacks_comp = MakeComparatorDD("DoiteCond_Aura_StacksComp", 155, row5_y+3, 50)
-    condFrame.cond_aura_stacks_val  = MakeSmallEdit("DoiteCond_Aura_StacksVal", 250, row5_y-2, 40)
+    condFrame.cond_aura_stacks_cb   = MakeCheck("DoiteCond_Aura_StacksCB", "Stacks", 90, row4_y)
+    condFrame.cond_aura_stacks_comp = MakeComparatorDD("DoiteCond_Aura_StacksComp", 155, row4_y+3, 50)
+    condFrame.cond_aura_stacks_val  = MakeSmallEdit("DoiteCond_Aura_StacksVal", 250, row4_y-2, 40)
     condFrame.cond_aura_stacks_val_enter = condFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     condFrame.cond_aura_stacks_val_enter:SetPoint("LEFT", condFrame.cond_aura_stacks_val, "RIGHT", 4, 0)
-    condFrame.cond_aura_stacks_val_enter:SetText("(enter)")
+    condFrame.cond_aura_stacks_val_enter:SetText("(#)")
     condFrame.cond_aura_stacks_val_enter:Hide()
+
+    condFrame.cond_aura_glow = MakeCheck("DoiteCond_Aura_Glow", "Glow", 20, row4_y)
+    condFrame.cond_aura_remaining_cb   = MakeCheck("DoiteCond_Aura_RemCB", "Remaining", 90, row5_y)
+    condFrame.cond_aura_remaining_comp = MakeComparatorDD("DoiteCond_Aura_RemComp", 155, row5_y+3, 50)
+    condFrame.cond_aura_remaining_val  = MakeSmallEdit("DoiteCond_Aura_RemVal", 250, row5_y-2, 40)
+    condFrame.cond_aura_remaining_val_enter = condFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    condFrame.cond_aura_remaining_val_enter:SetPoint("LEFT", condFrame.cond_aura_remaining_val, "RIGHT", 4, 0)
+    condFrame.cond_aura_remaining_val_enter:SetText("(sec.)")
+    condFrame.cond_aura_remaining_val_enter:Hide()
 
     condFrame.cond_aura_greyscale = MakeCheck("DoiteCond_Aura_Greyscale", "Grey", 20, row5_y)
 
@@ -561,47 +582,35 @@ local function CreateConditionsUI()
 	end)
 
 
-    -- Ability row3 scripts (target help/harm/self/all)
-    condFrame.cond_ability_target_help:SetScript("OnClick", function()
-        if this:GetChecked() then
-            condFrame.cond_ability_target_harm:SetChecked(false)
-            condFrame.cond_ability_target_self:SetChecked(false)
-            condFrame.cond_ability_target_all:SetChecked(false)
-            SetExclusiveTargetMode("help")
-        else
-            SetExclusiveTargetMode(nil)
-        end
-    end)
-    condFrame.cond_ability_target_harm:SetScript("OnClick", function()
-        if this:GetChecked() then
-            condFrame.cond_ability_target_help:SetChecked(false)
-            condFrame.cond_ability_target_self:SetChecked(false)
-            condFrame.cond_ability_target_all:SetChecked(false)
-            SetExclusiveTargetMode("harm")
-        else
-            SetExclusiveTargetMode(nil)
-        end
-    end)
-    condFrame.cond_ability_target_self:SetScript("OnClick", function()
-        if this:GetChecked() then
-            condFrame.cond_ability_target_help:SetChecked(false)
-            condFrame.cond_ability_target_harm:SetChecked(false)
-            condFrame.cond_ability_target_all:SetChecked(false)
-            SetExclusiveTargetMode("self")
-        else
-            SetExclusiveTargetMode(nil)
-        end
-    end)
-    condFrame.cond_ability_target_all:SetScript("OnClick", function()
-        if this:GetChecked() then
-            condFrame.cond_ability_target_help:SetChecked(false)
-            condFrame.cond_ability_target_harm:SetChecked(false)
-            condFrame.cond_ability_target_self:SetChecked(false)
-            SetExclusiveTargetMode("all")
-        else
-            SetExclusiveTargetMode(nil)
-        end
-    end)
+	-- Ability target row (multi-select, enforce at least one)
+	local function SaveAbilityTargetsFromUI()
+		if not currentKey then return end
+		local d = EnsureDBEntry(currentKey)
+		d.conditions = d.conditions or {}
+		d.conditions.ability = d.conditions.ability or {}
+		d.conditions.ability.targetHelp = condFrame.cond_ability_target_help:GetChecked() and true or false
+		d.conditions.ability.targetHarm = condFrame.cond_ability_target_harm:GetChecked() and true or false
+		d.conditions.ability.targetSelf = condFrame.cond_ability_target_self:GetChecked() and true or false
+	end
+
+	condFrame.cond_ability_target_help:SetScript("OnClick", function()
+		if not currentKey then this:SetChecked(false) return end
+		SaveAbilityTargetsFromUI()
+		SafeRefresh(); SafeEvaluate()
+	end)
+
+	condFrame.cond_ability_target_harm:SetScript("OnClick", function()
+		if not currentKey then this:SetChecked(false) return end
+		SaveAbilityTargetsFromUI()
+		SafeRefresh(); SafeEvaluate()
+	end)
+
+	condFrame.cond_ability_target_self:SetScript("OnClick", function()
+		if not currentKey then this:SetChecked(false) return end
+		SaveAbilityTargetsFromUI()
+		SafeRefresh(); SafeEvaluate()
+	end)
+
 
     -- Aura exclusivity (found / missing)
     condFrame.cond_aura_found:SetScript("OnClick", function()
@@ -644,60 +653,70 @@ local function CreateConditionsUI()
 		SetCombatFlag("aura", "out", this:GetChecked())
 	end)
 
-	-- Aura target row: allow target/self but ensure at least one checked
-	condFrame.cond_aura_ontarget:SetScript("OnClick", function()
-		if not currentKey then this:SetChecked(false) return end
+	-- Aura target row (Self is exclusive; Help/Harm can combine; at least one must be checked)
+	local function SaveAuraTargets()
+		if not currentKey then return end
 		local d = EnsureDBEntry(currentKey)
 		d.conditions = d.conditions or {}
 		d.conditions.aura = d.conditions.aura or {}
-		local otherChecked = condFrame.cond_aura_onself and condFrame.cond_aura_onself:GetChecked()
+		d.conditions.aura.targetHelp = condFrame.cond_aura_target_help:GetChecked() and true or false
+		d.conditions.aura.targetHarm = condFrame.cond_aura_target_harm:GetChecked() and true or false
+		d.conditions.aura.targetSelf = condFrame.cond_aura_onself:GetChecked()      and true or false
+	end
 
-		if this:GetChecked() then
-			if otherChecked then
-				d.conditions.aura.target = "both"
-			else
-				d.conditions.aura.target = "target"
-			end
-		else
-			if otherChecked then
-				d.conditions.aura.target = "self"
-			else
-				this:SetChecked(true)
-				return
+	local function EnforceAuraExclusivity(changedBox)
+		local h  = condFrame.cond_aura_target_help:GetChecked()
+		local hm = condFrame.cond_aura_target_harm:GetChecked()
+		local s  = condFrame.cond_aura_onself:GetChecked()
+
+		-- Self exclusive: if Self checked, uncheck Help/Harm
+		if changedBox == condFrame.cond_aura_onself and s then
+			condFrame.cond_aura_target_help:SetChecked(false)
+			condFrame.cond_aura_target_harm:SetChecked(false)
+		end
+
+		-- If Help/Harm gets checked while Self is on, turn Self off
+		if (changedBox == condFrame.cond_aura_target_help and condFrame.cond_aura_target_help:GetChecked())
+		   or (changedBox == condFrame.cond_aura_target_harm and condFrame.cond_aura_target_harm:GetChecked()) then
+			if condFrame.cond_aura_onself:GetChecked() then
+				condFrame.cond_aura_onself:SetChecked(false)
 			end
 		end
 
+		-- At least one must remain checked
+		h  = condFrame.cond_aura_target_help:GetChecked()
+		hm = condFrame.cond_aura_target_harm:GetChecked()
+		s  = condFrame.cond_aura_onself:GetChecked()
+		if (not h) and (not hm) and (not s) then
+			-- Re-check the one the user just toggled off
+			if changedBox then changedBox:SetChecked(true) end
+		end
+	end
+
+	condFrame.cond_aura_target_help:SetScript("OnClick", function()
+		if not currentKey then this:SetChecked(false) return end
+		EnforceAuraExclusivity(this)
+		SaveAuraTargets()
+		SafeRefresh(); SafeEvaluate()
 		UpdateCondFrameForKey(currentKey)
-		SafeRefresh()
-		SafeEvaluate()
+	end)
+
+	condFrame.cond_aura_target_harm:SetScript("OnClick", function()
+		if not currentKey then this:SetChecked(false) return end
+		EnforceAuraExclusivity(this)
+		SaveAuraTargets()
+		SafeRefresh(); SafeEvaluate()
+		UpdateCondFrameForKey(currentKey)
 	end)
 
 	condFrame.cond_aura_onself:SetScript("OnClick", function()
 		if not currentKey then this:SetChecked(false) return end
-		local d = EnsureDBEntry(currentKey)
-		d.conditions = d.conditions or {}
-		d.conditions.aura = d.conditions.aura or {}
-		local otherChecked = condFrame.cond_aura_ontarget and condFrame.cond_aura_ontarget:GetChecked()
-
-		if this:GetChecked() then
-			if otherChecked then
-				d.conditions.aura.target = "both"
-			else
-				d.conditions.aura.target = "self"
-			end
-		else
-			if otherChecked then
-				d.conditions.aura.target = "target"
-			else
-				this:SetChecked(true)
-				return
-			end
-		end
-
+		EnforceAuraExclusivity(this)
+		SaveAuraTargets()
+		SafeRefresh(); SafeEvaluate()
 		UpdateCondFrameForKey(currentKey)
-		SafeRefresh()
-		SafeEvaluate()
 	end)
+
 
     -- Aura remaining toggle
     condFrame.cond_aura_remaining_cb:SetScript("OnClick", function()
@@ -774,7 +793,7 @@ local function CreateConditionsUI()
     -- slider direction dd
     UIDropDownMenu_Initialize(condFrame.cond_ability_slider_dir, function(frame, level, menuList)
         local info
-        local choices = { "left", "right", "up", "down" }
+        local choices = { "left", "right", "center", "up", "down" }
         for _, c in ipairs(choices) do
             local picked = c
             info = {}
@@ -979,7 +998,7 @@ local function CreateConditionsUI()
         d.conditions.ability = d.conditions.ability or {}
         d.conditions.ability.slider = this:GetChecked() and true or false
         if d.conditions.ability.slider and not d.conditions.ability.sliderDir then
-            d.conditions.ability.sliderDir = "left"
+            d.conditions.ability.sliderDir = "center"
         end
         UpdateCondFrameForKey(currentKey)
         SafeRefresh()
@@ -1065,7 +1084,6 @@ local function CreateConditionsUI()
     condFrame.cond_ability_target_help:Hide()
     condFrame.cond_ability_target_harm:Hide()
     condFrame.cond_ability_target_self:Hide()
-    condFrame.cond_ability_target_all:Hide()
     condFrame.cond_ability_power:Hide()
     condFrame.cond_ability_power_comp:Hide()
     condFrame.cond_ability_power_val:Hide()
@@ -1084,8 +1102,9 @@ local function CreateConditionsUI()
     condFrame.cond_aura_missing:Hide()
     condFrame.cond_aura_incombat:Hide()
     condFrame.cond_aura_outcombat:Hide()
-    condFrame.cond_aura_ontarget:Hide()
-    condFrame.cond_aura_onself:Hide()
+	condFrame.cond_aura_target_help:Hide()
+	condFrame.cond_aura_target_harm:Hide()
+	condFrame.cond_aura_onself:Hide()
     condFrame.cond_aura_glow:Hide()
     condFrame.cond_aura_greyscale:Hide()
     condFrame.cond_aura_remaining_cb:Hide()
@@ -1117,7 +1136,6 @@ local function UpdateConditionsUI(data)
         condFrame.cond_ability_target_help:Show()
         condFrame.cond_ability_target_harm:Show()
         condFrame.cond_ability_target_self:Show()
-        condFrame.cond_ability_target_all:Show()
         condFrame.cond_ability_power:Show()
         condFrame.cond_ability_glow:Show()
         condFrame.cond_ability_greyscale:Show()
@@ -1146,12 +1164,14 @@ local function UpdateConditionsUI(data)
         condFrame.cond_ability_incombat:SetChecked(inC)
         condFrame.cond_ability_outcombat:SetChecked(outC)
 
-        -- target
-        local tgt = (c.ability and c.ability.target) or nil
-        condFrame.cond_ability_target_help:SetChecked(tgt == "help")
-        condFrame.cond_ability_target_harm:SetChecked(tgt == "harm")
-        condFrame.cond_ability_target_self:SetChecked(tgt == "self")
-        condFrame.cond_ability_target_all:SetChecked(tgt == "all")
+		-- multi-select booleans
+		local ah = (c.ability and c.ability.targetHelp) == true
+		local ar = (c.ability and c.ability.targetHarm) == true
+		local as = (c.ability and c.ability.targetSelf) == true
+		condFrame.cond_ability_target_help:SetChecked(ah)
+		condFrame.cond_ability_target_harm:SetChecked(ar)
+		condFrame.cond_ability_target_self:SetChecked(as)
+
 
         -- power controls
         local pEnabled = (c.ability and c.ability.powerEnabled) and true or false
@@ -1160,7 +1180,7 @@ local function UpdateConditionsUI(data)
             condFrame.cond_ability_power_comp:Show()
             condFrame.cond_ability_power_val:Show()
             condFrame.cond_ability_power_val_enter:Show()
-            local comp = (c.ability and c.ability.powerComp) or ">="
+            local comp = (c.ability and c.ability.powerComp) or ""
             UIDropDownMenu_SetSelectedValue(condFrame.cond_ability_power_comp, comp)
             UIDropDownMenu_SetText(comp, condFrame.cond_ability_power_comp)
             condFrame.cond_ability_power_val:SetText(tostring((c.ability and c.ability.powerVal) or 0))
@@ -1188,7 +1208,7 @@ local function UpdateConditionsUI(data)
                 condFrame.cond_ability_remaining_comp:Show()
                 condFrame.cond_ability_remaining_val:Show()
                 condFrame.cond_ability_remaining_val_enter:Show()
-                local comp = (c.ability and c.ability.remainingComp) or ">="
+                local comp = (c.ability and c.ability.remainingComp) or ""
                 UIDropDownMenu_SetSelectedValue(condFrame.cond_ability_remaining_comp, comp)
                 UIDropDownMenu_SetText(comp, condFrame.cond_ability_remaining_comp)
                 condFrame.cond_ability_remaining_val:SetText(tostring((c.ability and c.ability.remainingVal) or 0))
@@ -1202,7 +1222,7 @@ local function UpdateConditionsUI(data)
             condFrame.cond_ability_slider:Show()
             if slidEnabled then
                 condFrame.cond_ability_slider_dir:Show()
-                local dir = (c.ability and c.ability.sliderDir) or "left"
+                local dir = (c.ability and c.ability.sliderDir) or "center"
                 UIDropDownMenu_SetSelectedValue(condFrame.cond_ability_slider_dir, dir)
                 UIDropDownMenu_SetText(dir, condFrame.cond_ability_slider_dir)
             else
@@ -1243,8 +1263,9 @@ local function UpdateConditionsUI(data)
         condFrame.cond_aura_missing:Hide()
         condFrame.cond_aura_incombat:Hide()
         condFrame.cond_aura_outcombat:Hide()
-        condFrame.cond_aura_ontarget:Hide()
-        condFrame.cond_aura_onself:Hide()
+		condFrame.cond_aura_target_help:Hide()
+		condFrame.cond_aura_target_harm:Hide()
+		condFrame.cond_aura_onself:Hide()
         condFrame.cond_aura_glow:Hide()
         condFrame.cond_aura_greyscale:Hide()
         condFrame.cond_aura_remaining_cb:Hide()
@@ -1264,8 +1285,9 @@ local function UpdateConditionsUI(data)
 		if condFrame.cond_aura_tip then condFrame.cond_aura_tip:Show() end
         condFrame.cond_aura_incombat:Show()
         condFrame.cond_aura_outcombat:Show()
-        condFrame.cond_aura_ontarget:Show()
-        condFrame.cond_aura_onself:Show()
+		condFrame.cond_aura_target_help:Show()
+		condFrame.cond_aura_target_harm:Show()
+		condFrame.cond_aura_onself:Show()
         condFrame.cond_aura_glow:Show()
         condFrame.cond_aura_greyscale:Show()
 
@@ -1289,13 +1311,28 @@ local function UpdateConditionsUI(data)
         condFrame.cond_aura_incombat:SetChecked(aIn)
         condFrame.cond_aura_outcombat:SetChecked(aOut)
 
-        -- target
-		-- target default: prefer stored setting, fall back to "self"
-		local atarget = (c.aura and c.aura.target) or nil
-		condFrame.cond_aura_ontarget:SetChecked(atarget == "target" or atarget == "both")
-		condFrame.cond_aura_onself:SetChecked(atarget == "self"   or atarget == "both")
+		-- Read (treat nil as false here)
+		local th = (c.aura and c.aura.targetHelp) and true or false
+		local tm = (c.aura and c.aura.targetHarm) and true or false
+		local ts = (c.aura and c.aura.targetSelf) and true or false
 
+		-- Normalize: Self is exclusive vs Help/Harm
+		if ts then th, tm = false, false end
 
+		-- If somehow all false (old state), default to Self-only
+		if (not th) and (not tm) and (not ts) then
+			ts = true
+			if c.aura then
+				c.aura.targetSelf = true
+				c.aura.targetHelp = false
+				c.aura.targetHarm = false
+			end
+		end
+
+		-- Reflect
+		condFrame.cond_aura_target_help:SetChecked(th)
+		condFrame.cond_aura_target_harm:SetChecked(tm)
+		condFrame.cond_aura_onself:SetChecked(ts)
 
         condFrame.cond_aura_glow:SetChecked((c.aura and c.aura.glow) or false)
         condFrame.cond_aura_greyscale:SetChecked((c.aura and c.aura.greyscale) or false)
@@ -1322,22 +1359,32 @@ local function UpdateConditionsUI(data)
 			ClearDropdown(condFrame.cond_aura_formDD)
 		end
 
-        -- Remaining (only valid when aura found)
-        local aRemEnabled = (c.aura and c.aura.remainingEnabled) and true or false
-        condFrame.cond_aura_remaining_cb:SetChecked(aRemEnabled)
-        if amode == "found" and aRemEnabled then
-            condFrame.cond_aura_remaining_comp:Show()
-            condFrame.cond_aura_remaining_val:Show()
-            condFrame.cond_aura_remaining_val_enter:Show()
-            local comp = (c.aura and c.aura.remainingComp) or ">="
-            UIDropDownMenu_SetSelectedValue(condFrame.cond_aura_remaining_comp, comp)
-            UIDropDownMenu_SetText(comp, condFrame.cond_aura_remaining_comp)
-            condFrame.cond_aura_remaining_val:SetText(tostring((c.aura and c.aura.remainingVal) or 0))
-        else
-            condFrame.cond_aura_remaining_comp:Hide()
-            condFrame.cond_aura_remaining_val:Hide()
-            condFrame.cond_aura_remaining_val_enter:Hide()
-        end
+		-- Remaining (only valid when aura found AND On player (self))
+		local aRemEnabled = (c.aura and c.aura.remainingEnabled) and true or false
+		condFrame.cond_aura_remaining_cb:SetChecked(aRemEnabled)
+
+		-- Only show the checkbox itself when mode is "found" AND Self is selected
+		if amode == "found" and ts == true then
+			condFrame.cond_aura_remaining_cb:Show()
+			if aRemEnabled then
+				condFrame.cond_aura_remaining_comp:Show()
+				condFrame.cond_aura_remaining_val:Show()
+				condFrame.cond_aura_remaining_val_enter:Show()
+				local comp = (c.aura and c.aura.remainingComp) or ""
+				UIDropDownMenu_SetSelectedValue(condFrame.cond_aura_remaining_comp, comp)
+				UIDropDownMenu_SetText(comp, condFrame.cond_aura_remaining_comp)
+				condFrame.cond_aura_remaining_val:SetText(tostring((c.aura and c.aura.remainingVal) or 0))
+			else
+				condFrame.cond_aura_remaining_comp:Hide()
+				condFrame.cond_aura_remaining_val:Hide()
+				condFrame.cond_aura_remaining_val_enter:Hide()
+			end
+		else
+			condFrame.cond_aura_remaining_cb:Hide()
+			condFrame.cond_aura_remaining_comp:Hide()
+			condFrame.cond_aura_remaining_val:Hide()
+			condFrame.cond_aura_remaining_val_enter:Hide()
+		end
 
         -- Stacks (only valid when aura found)
         local aStacksEnabled = (c.aura and c.aura.stacksEnabled) and true or false
@@ -1346,7 +1393,7 @@ local function UpdateConditionsUI(data)
             condFrame.cond_aura_stacks_comp:Show()
             condFrame.cond_aura_stacks_val:Show()
             condFrame.cond_aura_stacks_val_enter:Show()
-            local comp = (c.aura and c.aura.stacksComp) or ">="
+            local comp = (c.aura and c.aura.stacksComp) or ""
             UIDropDownMenu_SetSelectedValue(condFrame.cond_aura_stacks_comp, comp)
             UIDropDownMenu_SetText(comp, condFrame.cond_aura_stacks_comp)
             condFrame.cond_aura_stacks_val:SetText(tostring((c.aura and c.aura.stacksVal) or 0))
@@ -1356,14 +1403,15 @@ local function UpdateConditionsUI(data)
             condFrame.cond_aura_stacks_val_enter:Hide()
         end
 
-        -- Show or hide the Remaining/Stacks checkboxes entirely depending on "found" state
-        if amode == "found" then
-            condFrame.cond_aura_remaining_cb:Show()
-            condFrame.cond_aura_stacks_cb:Show()
-        else
-            condFrame.cond_aura_remaining_cb:Hide()
-            condFrame.cond_aura_stacks_cb:Hide()
-        end
+		-- Only Stacks is globally gated by "found".
+		-- Remaining is already handled above and must also be "On player (self)".
+		if amode == "found" then
+			condFrame.cond_aura_stacks_cb:Show()
+		else
+			condFrame.cond_aura_stacks_cb:Hide()
+		end
+		-- Do NOT touch cond_aura_remaining_cb here; its visibility was decided above.
+
 
         -- Hide all ability controls
         condFrame.cond_ability_usable:Hide()
@@ -1374,7 +1422,6 @@ local function UpdateConditionsUI(data)
         condFrame.cond_ability_target_help:Hide()
         condFrame.cond_ability_target_harm:Hide()
         condFrame.cond_ability_target_self:Hide()
-        condFrame.cond_ability_target_all:Hide()
         condFrame.cond_ability_power:Hide()
         condFrame.cond_ability_power_comp:Hide()
         condFrame.cond_ability_power_val:Hide()
@@ -1519,7 +1566,7 @@ function DoiteConditions_Show(key)
     if not condFrame then
         condFrame = CreateFrame("Frame", "DoiteConditionsFrame", UIParent)
         condFrame:SetWidth(355)
-        condFrame:SetHeight(360)
+        condFrame:SetHeight(450)
         if DoiteAurasFrame and DoiteAurasFrame:GetName() then
             condFrame:SetPoint("TOPLEFT", DoiteAurasFrame, "TOPRIGHT", 5, 0)
         else
@@ -1542,7 +1589,7 @@ function DoiteConditions_Show(key)
 
         condFrame.groupTitle = condFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         condFrame.groupTitle:SetPoint("TOPLEFT", condFrame, "TOPLEFT", 20, -40)
-        condFrame.groupTitle:SetText("|cff33ff99GROUP & LEADER|r")
+        condFrame.groupTitle:SetText("|cff6FA8DCGROUP & LEADER|r")
 
         local sep = condFrame:CreateTexture(nil, "ARTWORK")
         sep:SetHeight(1)
@@ -1637,7 +1684,7 @@ function DoiteConditions_Show(key)
 
         condFrame.groupTitle2 = condFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         condFrame.groupTitle2:SetPoint("TOPLEFT", condFrame, "TOPLEFT", 20, -125)
-        condFrame.groupTitle2:SetText("|cff33ff99CONDITIONS & RULES|r")
+        condFrame.groupTitle2:SetText("|cff6FA8DCCONDITIONS & RULES|r")
 
         local sep2 = condFrame:CreateTexture(nil, "ARTWORK")
         sep2:SetHeight(1)
@@ -1650,13 +1697,13 @@ function DoiteConditions_Show(key)
         CreateConditionsUI()
 
         condFrame.groupTitle3 = condFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        condFrame.groupTitle3:SetPoint("TOPLEFT", condFrame, "TOPLEFT", 20, -270)
-        condFrame.groupTitle3:SetText("|cff33ff99POSITION & SIZE|r")
+        condFrame.groupTitle3:SetPoint("TOPLEFT", condFrame, "TOPLEFT", 20, -360)
+        condFrame.groupTitle3:SetText("|cff6FA8DCPOSITION & SIZE|r")
 
         condFrame.sep3 = condFrame:CreateTexture(nil, "ARTWORK")
         condFrame.sep3:SetHeight(1)
-        condFrame.sep3:SetPoint("TOPLEFT", condFrame, "TOPLEFT", 16, -285)
-        condFrame.sep3:SetPoint("TOPRIGHT", condFrame, "TOPRIGHT", -16, -285)
+        condFrame.sep3:SetPoint("TOPLEFT", condFrame, "TOPLEFT", 16, -375)
+        condFrame.sep3:SetPoint("TOPRIGHT", condFrame, "TOPRIGHT", -16, -275)
         condFrame.sep3:SetTexture(1,1,1)
         if condFrame.sep3.SetVertexColor then condFrame.sep3:SetVertexColor(1,1,1,0.25) end
 
@@ -1757,7 +1804,7 @@ function DoiteConditions_Show(key)
         if sliderWidth < 100 then sliderWidth = 100 end
 
         local baseX = 20
-        local baseY = -305
+        local baseY = -395
         local gap = 8
 
         condFrame.sliderX, condFrame.sliderXBox = MakeSlider("DoiteConditions_SliderX", "Horizontal Position", baseX, baseY, sliderWidth, -500, 500, 1)

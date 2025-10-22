@@ -28,15 +28,16 @@ local function GetOverlay()
 		overlay = CreateFrame("Frame", "DoiteGlowOverlay"..numOverlays)
 		overlay:SetFrameStrata("TOOLTIP")
 
-		overlay.bg = overlay:CreateTexture(nil, "BACKGROUND")
+		overlay.bg = overlay:CreateTexture(nil, "ARTWORK")   -- was "BACKGROUND"
 		overlay.bg:SetTexture("Interface\\AddOns\\DoiteAuras\\Textures\\IconAlert")
 		overlay.bg:SetTexCoord(0.0546, 0.4609, 0.3007, 0.5039)
 		overlay.bg:SetAllPoints(overlay)
 
-		overlay.glow = overlay:CreateTexture(nil, "MEDIUM")
+		overlay.glow = overlay:CreateTexture(nil, "OVERLAY") -- was "MEDIUM"
 		overlay.glow:SetTexture("Interface\\AddOns\\DoiteAuras\\Textures\\IconAlertAnts")
 		overlay.glow:SetTexCoord(texCoords[1][1], texCoords[1][2], texCoords[1][3], texCoords[1][4])
 		overlay.glow:SetAllPoints(overlay)
+		overlay.glow:SetBlendMode("ADD")
 	end
 	return overlay
 end
