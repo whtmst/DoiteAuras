@@ -1273,23 +1273,44 @@ function DoiteConditions:ApplyVisuals(key, show, glow, grey)
 
     if dataTbl and dataTbl.type == "Ability" and dataTbl.conditions and dataTbl.conditions.ability then
         local ca = dataTbl.conditions.ability
+        local startedSlide = false
+        local stoppedSlide = false                                -- NEW
+
         if ca.slider and (ca.mode == "usable" or ca.mode == "notcd") then
             local spellName = dataTbl.displayName or dataTbl.name
             local rem, dur = _AbilityCooldownByName(spellName)
-            -- Only slide in last 3s of a real CD (dur > 1.6 to skip GCD)
-            if rem and dur and dur > 1.6 and rem > 0 and rem <= 3.0 then
+
+            local wasSliding = SlideMgr.active and SlideMgr.active[key]
+            local maxWindow = math.min(3.0, (dur or 0) * 0.6)
+            local shouldStart    = (rem and dur and dur > 1.6 and rem > 0 and rem <= maxWindow)
+            local shouldContinue = wasSliding and rem and rem > 0
+
+            if shouldStart or shouldContinue then
                 local baseX, baseY = 0, 0
                 if _GetBaseXY then baseX, baseY = _GetBaseXY(key, dataTbl) end
                 SlideMgr:StartOrUpdate(key, (ca.sliderDir or "center"), baseX, baseY, GetTime() + rem)
+                startedSlide = (not wasSliding) and true or false   -- NEW: detect start edge
             else
+                if wasSliding then stoppedSlide = true end          -- NEW: detect stop edge
                 SlideMgr:Stop(key)
             end
         else
+            if SlideMgr.active and SlideMgr.active[key] then        -- NEW: detect stop when slider toggled off
+                stoppedSlide = true
+            end
             SlideMgr:Stop(key)
+        end
+
+        -- === NEW: immediate group reflow on slide start/stop ===
+        if (startedSlide or stoppedSlide) and DoiteGroup and DoiteGroup.ApplyGroupLayout then
+            if type(DoiteAuras) == "table" and type(DoiteAuras.GetAllCandidates) == "function" then
+                _G["DoiteGroup_NeedReflow"] = true
+            end
         end
     else
         SlideMgr:Stop(key)
     end
+
 	
 	    -- Pull the current slide offset/alpha (if sliding)
     local allowSlideShow = false
@@ -1299,7 +1320,11 @@ function DoiteConditions:ApplyVisuals(key, show, glow, grey)
 
         -- ==== Effective flags with OLD-behavior defaults ====
         -- 1) Always allow showing during slide (preview), like OLD code.
-        allowSlideShow = slideActive   -- NOTE: NO 'local' here; write the outer variable
+        allowSlideShow = false
+		if slideActive and dataTbl and dataTbl.conditions and dataTbl.conditions.ability then
+			allowSlideShow = (dataTbl.conditions.ability.slider == true)
+		end
+   -- NOTE: NO 'local' here; write the outer variable
 
         -- 2) Default suppression during slide UNLESS slider is explicitly enabled.
         local isSliderEnabled = false
@@ -1384,9 +1409,6 @@ function DoiteConditions:ApplyVisuals(key, show, glow, grey)
 
 		-- Apply position and alpha (no stutter: we set exact coordinates each paint)
 		do
-			local isGrouped = (dataTbl and dataTbl.group and dataTbl.group ~= "" and dataTbl.group ~= "no")
-			local isLeader  = (dataTbl and dataTbl.isLeader == true)
-
 			-- When sliding: apply transient movement to everyone (leaders + followers),
 			-- using the computed/group base for followers (set above).
 			if slideActive then
@@ -1437,14 +1459,19 @@ function DoiteConditions:ApplyVisuals(key, show, glow, grey)
                 local fs2 = frame._daTextLayer:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
                 fs2:SetJustifyH("RIGHT"); fs2:SetJustifyV("BOTTOM")
                 frame._daTextStacks = fs2
+				frame._daLastTextSize = 0
             end
 
-            -- Scale fonts based on icon size
-            local w = frame:GetWidth() or 36
-            local remSize   = math.max(10, math.floor(w * 0.42)) -- center text
-            local stackSize = math.max(8,  math.floor(w * 0.28)) -- corner text
-            frame._daTextRem:SetFont(GameFontHighlight:GetFont(), remSize, "OUTLINE")
-            frame._daTextStacks:SetFont(GameFontNormalSmall:GetFont(), stackSize, "OUTLINE")
+			-- Only resize if changed
+			local w = frame:GetWidth() or 36
+			local last = frame._daLastTextSize or 0
+			if math.abs(w - last) >= 1 then
+				frame._daLastTextSize = w
+				local remSize   = math.max(10, math.floor(w * 0.42))
+				local stackSize = math.max(8,  math.floor(w * 0.28))
+				frame._daTextRem:SetFont(GameFontHighlight:GetFont(), remSize, "OUTLINE")
+				frame._daTextStacks:SetFont(GameFontNormalSmall:GetFont(), stackSize, "OUTLINE")
+			end
 
             -- Anchor (relative to the icon frame; parented to _daTextLayer)
             frame._daTextRem:ClearAllPoints()
@@ -1460,49 +1487,70 @@ function DoiteConditions:ApplyVisuals(key, show, glow, grey)
             frame._daTextStacks:Hide()
 
             -- ========== Remaining Time ==========
-			local wantRem = false
-			local remText = nil
+            local wantRem = false
+            local remText = nil
 
-			if dataTbl then
-				if dataTbl.type == "Ability" and dataTbl.conditions and dataTbl.conditions.ability then
-					local ca = dataTbl.conditions.ability
-					if ca.textTimeRemaining == true then
-						-- Show timer text only when:
-						--   (mode == oncd) OR ((mode == usable/notcd) AND slider enabled)
-						local allowText =
-							(ca.mode == "oncd") or
-							((ca.mode == "usable" or ca.mode == "notcd") and ca.slider == true)
+            -- Decide if we should show time text for abilities
+            local function _ShowAbilityTime(ca, rem, dur, slideActive)
+                if not rem or rem <= 0 then return false end
+                dur = dur or 0
 
-						if allowText then
-							local spellName = dataTbl.displayName or dataTbl.name
-							local rem, dur  = _AbilityCooldownByName(spellName)
+                -- 1) ON COOLDOWN: always show for the entire real cooldown.
+                --    No "last 60%" window; still ignore pure non-cooldown (dur==0).
+                if ca.mode == "oncd" then
+                    return (dur > 0)  -- allow short cds too; icon itself is already gated by >1.5s in conditions
+                end
 
-							-- Guard against the GLOBAL COOLDOWN: ignore short cooldowns (<= 1.6s)
-							if rem and rem > 0 and dur and dur > 1.6 then
-								remText = _FmtRem(rem)
-								wantRem = (remText ~= nil)
-							end
-						end
-					end
-				elseif (dataTbl.type == "Buff" or dataTbl.type == "Debuff") and dataTbl.conditions and dataTbl.conditions.aura then
-					local ca = dataTbl.conditions.aura
-					if ca.textTimeRemaining == true and ca.targetSelf == true then
-						-- Icon text timer only supported for player-self auras in 1.12
-						local auraName = dataTbl.displayName or dataTbl.name
-						local rem = _PlayerAuraRemainingSeconds(auraName)
-						if rem and rem > 0 then
-							remText = _FmtRem(rem)
-							wantRem = (remText ~= nil)
-						end
-					end
-				end
-			end
+                -- 2) USABLE / NOTCD with slider: if slide is active,
+                --    keep showing even if the remaining time is being postponed by GCD.
+                if (ca.mode == "usable" or ca.mode == "notcd") and ca.slider == true then
+                    if slideActive then
+                        return true  -- ignore the 1.6s/GCD filter while sliding
+                    end
+                    -- when not sliding: restrict to late window to avoid spam
+                    local maxWindow = math.min(3.0, (dur or 0) * 0.6)
+                    return rem <= maxWindow and (dur > 1.6)
+                end
 
-			if wantRem and remText then
-				frame._daTextRem:SetText(remText)
-				frame._daTextRem:SetTextColor(1, 1, 1, 1) -- white
-				frame._daTextRem:Show()
-			end
+                -- Default (paranoid): late window + real cooldown
+                local maxWindow = math.min(3.0, (dur or 0) * 0.6)
+                return (dur > 1.6) and (rem <= maxWindow)
+            end
+
+            if dataTbl then
+                if dataTbl.type == "Ability" and dataTbl.conditions and dataTbl.conditions.ability then
+                    local ca = dataTbl.conditions.ability
+                    if ca.textTimeRemaining == true then
+                        local spellName = dataTbl.displayName or dataTbl.name
+                        local rem, dur  = _AbilityCooldownByName(spellName)
+
+                        -- If we SHOULD show (per rules above), format and display.
+                        if _ShowAbilityTime(ca, rem, dur, slideActive) then
+                            remText = _FmtRem(rem)
+                            wantRem = (remText ~= nil)
+                        end
+                    end
+
+                elseif (dataTbl.type == "Buff" or dataTbl.type == "Debuff")
+                   and dataTbl.conditions and dataTbl.conditions.aura then
+                    local ca = dataTbl.conditions.aura
+                    if ca.textTimeRemaining == true and ca.targetSelf == true then
+                        -- Icon text timer only supported for player-self auras in 1.12
+                        local auraName = dataTbl.displayName or dataTbl.name
+                        local rem = _PlayerAuraRemainingSeconds(auraName)
+                        if rem and rem > 0 then
+                            remText = _FmtRem(rem)
+                            wantRem = (remText ~= nil)
+                        end
+                    end
+                end
+            end
+
+            if wantRem and remText then
+                frame._daTextRem:SetText(remText)
+                frame._daTextRem:SetTextColor(1, 1, 1, 1) -- white
+                frame._daTextRem:Show()
+            end
 
             -- ========== Stack Counter (auras only) ==========
             if dataTbl and (dataTbl.type == "Buff" or dataTbl.type == "Debuff")
@@ -1527,7 +1575,7 @@ function DoiteConditions:ApplyVisuals(key, show, glow, grey)
 
                     if unitToCheck then
                         local cnt = _GetAuraStacksOnUnit(unitToCheck, auraName, wantDebuff)
-                        if cnt and cnt > 1 then
+                        if cnt and cnt >= 1 then
                             frame._daTextStacks:SetText(tostring(cnt))
                             frame._daTextStacks:SetTextColor(1, 0.2, 0.2, 1) -- red
                             frame._daTextStacks:Show()
@@ -1587,11 +1635,7 @@ function DoiteConditions:ApplyVisuals(key, show, glow, grey)
         if frame._lastShowState ~= show then
             frame._lastShowState = show
             if type(DoiteAuras) == "table" and type(DoiteAuras.GetAllCandidates) == "function" then
-                local all = DoiteAuras.GetAllCandidates()
-                if all and type(all) == "table" then
-                    -- fire immediately; layout is cheap and avoids stacking
-                    pcall(DoiteGroup.ApplyGroupLayout, all)
-                end
+                _G["DoiteGroup_NeedReflow"] = true
             end
         end
     end
@@ -1661,16 +1705,17 @@ _tick:SetScript("OnUpdate", function()
     end
 
     -- Render faster while sliding; else ~30fps
-    local thresh = (next(SlideMgr.active) ~= nil) and 0.016 or 0.033
+    local thresh = (next(SlideMgr.active) ~= nil) and 0.03 or 0.033
     if _acc < thresh then return end
     _acc = 0
 
 	local needAbility = dirty_ability or dirty_power
-	local needAura    = dirty_aura or dirty_target or dirty_power
+	local needAura = dirty_aura or dirty_target
 	if needAbility then DoiteConditions:EvaluateAbilities() end
 	if needAura then DoiteConditions:EvaluateAuras() end
     if needAbility or needAura then
-        dirty_ability, dirty_aura, dirty_target, dirty_power = false, false, false, false
+        dirty_aura, dirty_target, dirty_power = false, false, false
+		dirty_ability = next(SlideMgr.active) and true or false
     end
 end)
 

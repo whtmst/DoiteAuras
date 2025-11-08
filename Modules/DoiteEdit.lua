@@ -529,13 +529,21 @@ local function SetExclusiveAuraFoundMode(mode)
 	SafeEvaluate()
 end
 
+-- File-scope helper so both CreateConditionsUI and UpdateConditionsUI can call it
+local function _GoldifyDD(dd)
+    if not dd or not dd.GetName then return end
+    local name = dd:GetName()
+    if not name then return end
+    local txt = _G[name .. "Text"]
+    if txt and txt.SetTextColor then txt:SetTextColor(1, 0.82, 0) end
+end
+
 ----------------------------------------------------------------
 -- Conditions UI creation & wiring
 ----------------------------------------------------------------
 local function CreateConditionsUI()
     if not condFrame then return end
 
-    -- helpers
     -- helpers (parent to the scrollable content area)
 	local function _Parent()
 		return (condFrame and condFrame._condArea) or condFrame
@@ -1244,6 +1252,7 @@ local function CreateConditionsUI()
                 d.conditions.ability.sliderDir = val
                 UIDropDownMenu_SetSelectedValue(condFrame.cond_ability_slider_dir, val)
                 UIDropDownMenu_SetText(val, condFrame.cond_ability_slider_dir)
+				_GoldifyDD(condFrame.cond_ability_slider_dir)
                 CloseDropDownMenus()
                 SafeRefresh()
 				SafeEvaluate()
@@ -1789,6 +1798,7 @@ local function UpdateConditionsUI(data)
             local comp = (c.ability and c.ability.powerComp) or ""
             UIDropDownMenu_SetSelectedValue(condFrame.cond_ability_power_comp, comp)
             UIDropDownMenu_SetText(comp, condFrame.cond_ability_power_comp)
+			_GoldifyDD(condFrame.cond_ability_power_comp)
             condFrame.cond_ability_power_val:SetText(tostring((c.ability and c.ability.powerVal) or 0))
         else
             condFrame.cond_ability_power_comp:Hide()
@@ -1817,6 +1827,7 @@ local function UpdateConditionsUI(data)
                 local comp = (c.ability and c.ability.remainingComp) or ""
                 UIDropDownMenu_SetSelectedValue(condFrame.cond_ability_remaining_comp, comp)
                 UIDropDownMenu_SetText(comp, condFrame.cond_ability_remaining_comp)
+				_GoldifyDD(condFrame.cond_ability_remaining_comp)
                 condFrame.cond_ability_remaining_val:SetText(tostring((c.ability and c.ability.remainingVal) or 0))
             else
                 condFrame.cond_ability_remaining_comp:Hide()
@@ -1831,6 +1842,7 @@ local function UpdateConditionsUI(data)
                 local dir = (c.ability and c.ability.sliderDir) or "center"
                 UIDropDownMenu_SetSelectedValue(condFrame.cond_ability_slider_dir, dir)
                 UIDropDownMenu_SetText(dir, condFrame.cond_ability_slider_dir)
+				_GoldifyDD(condFrame.cond_ability_slider_dir)
             else
                 condFrame.cond_ability_slider_dir:Hide()
             end
@@ -1853,6 +1865,7 @@ local function UpdateConditionsUI(data)
                 local comp = (c.ability and c.ability.cpComp) or ""
                 UIDropDownMenu_SetSelectedValue(condFrame.cond_ability_cp_comp, comp)
                 UIDropDownMenu_SetText(comp, condFrame.cond_ability_cp_comp)
+				_GoldifyDD(condFrame.cond_ability_cp_comp)
                 condFrame.cond_ability_cp_val:SetText(tostring((c.ability and c.ability.cpVal) or 0))
             else
                 condFrame.cond_ability_cp_comp:Hide()
@@ -1879,6 +1892,7 @@ local function UpdateConditionsUI(data)
             local comp = (c.ability and c.ability.hpComp) or ""
             UIDropDownMenu_SetSelectedValue(condFrame.cond_ability_hp_comp, comp)
             UIDropDownMenu_SetText(comp, condFrame.cond_ability_hp_comp)
+			_GoldifyDD(condFrame.cond_ability_hp_comp)
             condFrame.cond_ability_hp_val:SetText(tostring((c.ability and c.ability.hpVal) or 0))
         else
             condFrame.cond_ability_hp_comp:Hide()
@@ -1976,8 +1990,10 @@ local function UpdateConditionsUI(data)
 			if v and v ~= "All" and v ~= "" then
 				UIDropDownMenu_SetSelectedValue(condFrame.cond_ability_formDD, v)
 				UIDropDownMenu_SetText(v, condFrame.cond_ability_formDD)
+				_GoldifyDD(condFrame.cond_ability_formDD)
 			else
 				UIDropDownMenu_SetText("Select form", condFrame.cond_ability_formDD)
+				_GoldifyDD(condFrame.cond_ability_formDD)
 			end
 		elseif condFrame.cond_ability_formDD then
 			condFrame.cond_ability_formDD:Hide()
@@ -2152,6 +2168,7 @@ local function UpdateConditionsUI(data)
                 local comp = (c.aura and c.aura.cpComp) or ""
                 UIDropDownMenu_SetSelectedValue(condFrame.cond_aura_cp_comp, comp)
                 UIDropDownMenu_SetText(comp, condFrame.cond_aura_cp_comp)
+				_GoldifyDD(condFrame.cond_aura_cp_comp)
                 condFrame.cond_aura_cp_val:SetText(tostring((c.aura and c.aura.cpVal) or 0))
             else
                 condFrame.cond_aura_cp_comp:Hide()
@@ -2178,6 +2195,7 @@ local function UpdateConditionsUI(data)
             local comp = (c.aura and c.aura.hpComp) or ""
             UIDropDownMenu_SetSelectedValue(condFrame.cond_aura_hp_comp, comp)
             UIDropDownMenu_SetText(comp, condFrame.cond_aura_hp_comp)
+			_GoldifyDD(condFrame.cond_aura_hp_comp)
             condFrame.cond_aura_hp_val:SetText(tostring((c.aura and c.aura.hpVal) or 0))
         else
             condFrame.cond_aura_hp_comp:Hide()
@@ -2224,6 +2242,7 @@ local function UpdateConditionsUI(data)
             local comp = (c.aura and c.aura.powerComp) or ""
             UIDropDownMenu_SetSelectedValue(condFrame.cond_aura_power_comp, comp)
             UIDropDownMenu_SetText(comp, condFrame.cond_aura_power_comp)
+			_GoldifyDD(condFrame.cond_aura_power_comp)
             condFrame.cond_aura_power_val:SetText(tostring((c.aura and c.aura.powerVal) or 0))
         else
             condFrame.cond_aura_power_comp:Hide()
@@ -2250,8 +2269,10 @@ local function UpdateConditionsUI(data)
 			if v and v ~= "All" and v ~= "" then
 				UIDropDownMenu_SetSelectedValue(condFrame.cond_aura_formDD, v)
 				UIDropDownMenu_SetText(v, condFrame.cond_aura_formDD)
+				_GoldifyDD(condFrame.cond_aura_formDD)
 			else
 				UIDropDownMenu_SetText("Select form", condFrame.cond_aura_formDD)
+				_GoldifyDD(condFrame.cond_aura_formDD)
 			end
 		elseif condFrame.cond_aura_formDD then
 			condFrame.cond_aura_formDD:Hide()
@@ -2280,6 +2301,7 @@ local function UpdateConditionsUI(data)
 					local comp = (c.aura and c.aura.remainingComp) or ""
 					UIDropDownMenu_SetSelectedValue(condFrame.cond_aura_remaining_comp, comp)
 					UIDropDownMenu_SetText(comp, condFrame.cond_aura_remaining_comp)
+					_GoldifyDD(condFrame.cond_aura_remaining_comp)
 					condFrame.cond_aura_remaining_val:SetText(tostring((c.aura and c.aura.remainingVal) or 0))
 				else
 					_hideRemInputs()
@@ -2310,6 +2332,7 @@ local function UpdateConditionsUI(data)
             local comp = (c.aura and c.aura.stacksComp) or ""
             UIDropDownMenu_SetSelectedValue(condFrame.cond_aura_stacks_comp, comp)
             UIDropDownMenu_SetText(comp, condFrame.cond_aura_stacks_comp)
+			_GoldifyDD(condFrame.cond_aura_stacks_comp)
             condFrame.cond_aura_stacks_val:SetText(tostring((c.aura and c.aura.stacksVal) or 0))
         else
             condFrame.cond_aura_stacks_comp:Hide()

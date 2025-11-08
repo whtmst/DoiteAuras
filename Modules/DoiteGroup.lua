@@ -27,7 +27,6 @@ local function editingKey()
     return _G["DoiteEdit_CurrentKey"]
 end
 
-
 ---------------------------------------------------------------
 -- Compute layout for a single group, driven by the group's leader
 ---------------------------------------------------------------
@@ -178,10 +177,11 @@ function DoiteGroup.ApplyGroupLayout(candidates)
         end
     end
 
-    -- 2) Compute each group’s layout
-    for gName, list in pairs(groups) do
-        ComputeGroupLayout(list, gName)
-    end
+    _hasGroups = false
+	for gName, list in pairs(groups) do
+		ComputeGroupLayout(list, gName)
+		_hasGroups = true
+	end
 
     -- 3) Publish for ApplyVisuals
     _G["DoiteGroup_Computed"] = groups
@@ -194,7 +194,8 @@ end
 -- We recompute only when the group “signature” changes.
 local _watch = CreateFrame("Frame")
 local _acc   = 0
-local _lastSig = {}   -- [groupName] = "key:shown:order,..."
+local _lastSig = {}
+local _hasGroups = false
 
 local function _collectCandidates()
     if type(DoiteAuras) == "table" and type(DoiteAuras.GetAllCandidates) == "function" then
@@ -230,31 +231,45 @@ end
 
 _watch:SetScript("OnUpdate", function()
     _acc = _acc + (arg1 or 0)
-    if _acc < 0.05 then return end
+    if _acc < 0.1 then return end
     _acc = 0
 
+    local needFlag = _G["DoiteGroup_NeedReflow"] == true
+
     local candidates = _collectCandidates()
-    if not candidates or table.getn(candidates) == 0 then return end
+    if not candidates or table.getn(candidates) == 0 then
+        _G["DoiteGroup_NeedReflow"] = nil
+        return
+    end
 
-    local sigs = _buildSignatures(candidates)
+    -- quick skip if no grouped members (unless forced by flag)
+    local hasAnyGroup = false
+    if not needFlag then
+        for _, e in ipairs(candidates) do
+            if isValidGroupMember(e) then hasAnyGroup = true; break end
+        end
+        if not hasAnyGroup then return end
+    end
+
     local changed = false
-
-    for g, sig in pairs(sigs) do
-        if _lastSig[g] ~= sig then
-            _lastSig[g] = sig
-            changed = true
+    if not needFlag then
+        local sigs = _buildSignatures(candidates)
+        for g, sig in pairs(sigs) do
+            if _lastSig[g] ~= sig then
+                _lastSig[g] = sig
+                changed = true
+            end
+        end
+        for g, _ in pairs(_lastSig) do
+            if not sigs[g] then
+                _lastSig[g] = nil
+                changed = true
+            end
         end
     end
-    -- Also detect groups that disappeared
-    for g, _ in pairs(_lastSig) do
-        if not sigs[g] then
-            _lastSig[g] = nil
-            changed = true
-        end
-    end
 
-    if changed and not _G["DoiteGroup_LayoutInProgress"] then
-        -- Single reflow per tick
+    if (changed or needFlag) and not _G["DoiteGroup_LayoutInProgress"] then
+        _G["DoiteGroup_NeedReflow"] = nil
         DoiteGroup.ApplyGroupLayout(candidates)
     end
 end)

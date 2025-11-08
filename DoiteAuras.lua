@@ -212,7 +212,7 @@ closeBtn:SetScript("OnClick", function() this:GetParent():Hide() end)
 
 -- Input box + Add
 local input = CreateFrame("EditBox", "DoiteAurasInput", frame, "InputBoxTemplate")
-input:SetWidth(160)
+input:SetWidth(240)
 input:SetHeight(20)
 input:SetPoint("TOPLEFT", intro, "TOPLEFT", 5, -15)
 input:SetAutoFocus(false)
