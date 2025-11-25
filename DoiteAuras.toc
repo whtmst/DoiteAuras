@@ -11,3 +11,4 @@ Modules\DoiteEdit.lua
 Modules\DoiteGlow.lua
 Modules\DoiteConditions.lua
 Modules\DoiteGroup.lua
+Modules\DoiteExport.lua

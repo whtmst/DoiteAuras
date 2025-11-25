@@ -22,6 +22,23 @@ local function isKnown(entry)
     return not (entry and entry.data and entry.data.isUnknown)
 end
 
+-- Resolve sort mode for a group: "prio" (default) or "time"
+local function GetGroupSortMode(groupName)
+    if not groupName then
+        return "prio"
+    end
+
+    local db = DoiteAurasDB
+    if db and db.groupSort and db.groupSort[groupName] then
+        local mode = db.groupSort[groupName]
+        if mode == "time" then
+            return "time"
+        end
+    end
+
+    return "prio"
+end
+
 -- Current key being edited (published by DoiteEdit.lua)
 local function editingKey()
     return _G["DoiteEdit_CurrentKey"]
@@ -79,20 +96,53 @@ local function ComputeGroupLayout(entries, groupName)
         return {}
     end
 
-    -- 3) Order by saved priority (ascending); tie-break by key for stability
+    -- Decide how to sort this group: "prio" (default) or "time"
+    local sortMode = GetGroupSortMode(groupName)
+
+    -- 3) Order by saved priority or remaining time, depending on sort mode
     table.sort(visibleKnown, function(a, b)
-		-- Put the edited member first (if present)
-		if editKey then
-			if a.key == editKey and b.key ~= editKey then return true end
-			if b.key == editKey and a.key ~= editKey then return false end
-		end
-		local oa = num(a.data.order, 999)
-		local ob = num(b.data.order, 999)
-		if oa == ob then
-			return (tostring(a.key) < tostring(b.key))
-		end
-		return oa < ob
-	end)
+        -- Put the edited member first (if present)
+        if editKey then
+            if a.key == editKey and b.key ~= editKey then return true end
+            if b.key == editKey and a.key ~= editKey then return false end
+        end
+
+        local da = a.data or {}
+        local db = b.data or {}
+        local oa = num(da.order, 999)
+        local ob = num(db.order, 999)
+
+        -- Time-based sort: timed icons (with remaining time) first, then by lowest remaining
+        if sortMode == "time" then
+            local fa = _G["DoiteIcon_" .. a.key]
+            local fb = _G["DoiteIcon_" .. b.key]
+
+            local ra = fa and fa._daSortRem or nil
+            local rb = fb and fb._daSortRem or nil
+
+            if ra and ra <= 0 then ra = nil end
+            if rb and rb <= 0 then rb = nil end
+
+            local hasA = ra and true or false
+            local hasB = rb and true or false
+
+            -- Timed entries come before non-timed entries
+            if hasA ~= hasB then
+                return hasA
+            end
+
+            -- Both timed: lower remaining time first
+            if hasA and hasB and ra ~= rb then
+                return ra < rb
+            end
+        end
+
+        -- Default / fallback: priority by order, then key (unchanged behaviour)
+        if oa == ob then
+            return (tostring(a.key) < tostring(b.key))
+        end
+        return oa < ob
+    end)
 
     -- 4) Assign up to numAuras slots, starting from leader’s baseXY
     local placed = {}
