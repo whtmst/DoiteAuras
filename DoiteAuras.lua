@@ -21,6 +21,48 @@ local function DA_Cache()
   return DoiteAurasDB.cache
 end
 
+---------------------------------------------------------------
+-- SuperWoW / Nampower / UnitXP SP3 requirement helper
+---------------------------------------------------------------
+local function DA_GetMissingRequiredMods()
+  local missing = {}
+
+  -- SuperWoW: SUPERWOW_VERSION must be a non-empty string
+  local hasSuper = (type(SUPERWOW_VERSION) == "string" and SUPERWOW_VERSION ~= "")
+  if not hasSuper then
+    table.insert(missing, "SuperWoW")
+  end
+
+  -- Nampower: GetNampowerVersion() must exist and return numbers
+  local hasNampower = false
+  if type(GetNampowerVersion) == "function" then
+    local ok, maj = pcall(GetNampowerVersion)
+    if ok and type(maj) == "number" then
+      hasNampower = true
+    end
+  end
+  if not hasNampower then
+    table.insert(missing, "Nampower")
+  end
+
+  -- UnitXP SP3: pcall(UnitXP, "nop", "nop") must succeed
+  local hasUnitXP = false
+  if type(UnitXP) == "function" then
+    local ok = pcall(UnitXP, "nop", "nop")
+    if ok then
+      hasUnitXP = true
+    end
+  end
+  if not hasUnitXP then
+    table.insert(missing, "UnitXP SP3")
+  end
+
+  return missing
+end
+
+local function DA_IsHardDisabled()
+  return _G["DoiteAuras_HardDisabled"] == true
+end
 
 -- Persistent store for group layout computed positions
 _G["DoiteGroup_Computed"]       = _G["DoiteGroup_Computed"]       or {}
@@ -199,7 +241,7 @@ if sep.SetVertexColor then sep:SetVertexColor(1,1,1,0.25) end
 -- Intro text
 local intro = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
 intro:SetPoint("TOPLEFT", frame, "TOPLEFT", 20, -40)
-intro:SetText("Enter the EXACT name of the buff or debuff.")
+intro:SetText("Enter the EXACT name or spell ID of the buff or debuff.")
 
 -- Close button
 local closeBtn = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
@@ -830,7 +872,7 @@ local function DA_UpdateTypeUI()
 
     elseif currentType == "Buff" or currentType == "Debuff" then
         -- Buffs/Debuffs: manual text input
-        intro:SetText("Enter the EXACT name of the ability, buff or debuff.")
+        intro:SetText("Enter the EXACT name or spell ID of the buff or debuff.")
         input:Show()
         if abilityDropDown then abilityDropDown:Hide() end
         if itemDropDown then itemDropDown:Hide() end
@@ -1455,12 +1497,33 @@ local function RebuildOrder()
     local ordered = GetOrderedSpells()
     for i=1, table.getn(ordered) do DoiteAurasDB.spells[ordered[i].key].order = i end
 end
+
 local function FindSpellBookSlot(spellName)
-    for tab=1, GetNumSpellTabs() do
+    if not spellName or spellName == "" then return nil end
+
+    -- Prefer Nampower fast lookup when available
+    if type(GetSpellSlotTypeIdForName) == "function" then
+        local ok, slot, bookType = pcall(GetSpellSlotTypeIdForName, spellName)
+        if ok and slot and slot > 0 and (bookType == "spell" or bookType == "pet" or bookType == "unknown") then
+            return slot
+        end
+    end
+
+    -- Fallback: legacy full spellbook scan (should almost never run with Nampower present)
+    if not GetNumSpellTabs or not GetSpellTabInfo or not GetSpellName then
+        return nil
+    end
+
+    for tab = 1, (GetNumSpellTabs() or 0) do
         local _, _, offset, numSlots = GetSpellTabInfo(tab)
-        for i=1, numSlots do
-            local name = GetSpellName(i+offset, BOOKTYPE_SPELL)
-            if name == spellName then return i+offset end
+        if numSlots and numSlots > 0 then
+            for i = 1, numSlots do
+                local idx  = offset + i
+                local name = GetSpellName(idx, BOOKTYPE_SPELL)
+                if name == spellName then
+                    return idx
+                end
+            end
         end
     end
     return nil
@@ -1555,50 +1618,64 @@ end
 
 -- Refresh icons (group-aware)
 local function RefreshIcons()
+    if DA_IsHardDisabled() then
+        -- Make sure all existing icon frames stay hidden
+        if icons then
+            for _, f in pairs(icons) do
+                if f and f.Hide then f:Hide() end
+            end
+        end
+        return
+    end
     if not _CanRunRefresh() then return end
     local ordered = GetOrderedSpells()
     local total = table.getn(ordered)
     local candidates = {}
 
-    -- Step 1: collect all icon states
+    -- Step 1: collect lightweight icon state (no extra combat logic – DoiteConditions owns that)
     for i = 1, total do
-        local key = ordered[i].key
+        local key  = ordered[i].key
         local data = ordered[i].data
-        local typ = data and data.type or "Ability"
-        local tex, shouldShow = nil, false
+        local typ  = data and data.type or "Ability"
 
-        if typ == "Ability" then
-            local slot = FindSpellBookSlot(data.displayName or data.name)
-            if slot then
-                local start, dur, en = GetSpellCooldown(slot, BOOKTYPE_SPELL)
-                if en == 1 and (dur == 0 or dur == nil) then
-                    tex = GetSpellTexture(slot, BOOKTYPE_SPELL)
-                    shouldShow = true
-                end
+        local displayName = (data and (data.displayName or data.name)) or key
+        local cache       = DA_Cache()
+
+        -- Start from any cached/saved texture
+        local tex = cache[displayName]
+        if not tex and data and data.iconTexture then
+            tex = data.iconTexture
+        end
+
+        -- For Abilities only: single cheap fallback via spell slot (Nampower-accelerated)
+        if not tex and typ == "Ability" then
+            local slot = FindSpellBookSlot(displayName)
+            if slot and GetSpellTexture then
+                tex = GetSpellTexture(slot, BOOKTYPE_SPELL)
             end
+        end
 
-        elseif typ == "Buff" then
-            local found, btex = FindPlayerBuff(data.displayName or data.name)
-            if found then shouldShow, tex = true, btex end
+        -- Persist texture back into cache + DB once its known
+        if tex then
+            cache[displayName] = tex
+            if data and not data.iconTexture then
+                data.iconTexture = tex
+            end
+        end
 
-        elseif typ == "Debuff" then
-            local found, dtex = FindPlayerDebuff(data.displayName or data.name)
-            if found then shouldShow, tex = true, dtex end
-
-        elseif typ == "Item" then
-            -- Items: just resolve the texture here; visibility is driven by conditions.
-            local nm    = data.displayName or data.name
-            local cache = DA_Cache()
-            tex = (nm and cache[nm]) or data.iconTexture
-            -- keep shouldShow = false; DoiteConditions will set _daShouldShow when appropriate
+        -- Show/hide intent comes solely from DoiteConditions via icon flags
+        local f = _G["DoiteIcon_" .. key]
+        local wants = false
+        if f then
+            wants = (f._daShouldShow == true) or (f._daSliding == true)
         end
 
         local candidate = {
             key  = key,
             data = data,
-            show = shouldShow,
+            show = wants,
             tex  = tex,
-            size = data.iconSize or data.size or 36,
+            size = (data and (data.iconSize or data.size)) or 36,
         }
 
         -- Stamp the logical bucket this icon belongs to (group/category/ungrouped)
@@ -1674,43 +1751,43 @@ local function RefreshIcons()
         end
 
         -- compute final pos/size (group-aware, sticky)
-		local posX, posY, size
-		local isGrouped = (data and data.group and data.group ~= "" and data.group ~= "no")
-		local isLeader  = (data and data.isLeader == true)
+        local posX, posY, size
+        local isGrouped = (data and data.group and data.group ~= "" and data.group ~= "no")
+        local isLeader  = (data and data.isLeader == true)
 
-		-- 1) Prefer the freshly computed position (if present on this entry)
-		if entry._computedPos then
-			posX = entry._computedPos.x
-			posY = entry._computedPos.y
-			size = entry._computedPos.size
+        -- 1) Prefer the freshly computed position (if present on this entry)
+        if entry._computedPos then
+            posX = entry._computedPos.x
+            posY = entry._computedPos.y
+            size = entry._computedPos.size
 
-		-- 2) Otherwise prefer the persisted computed layout from the last layout tick
-		elseif isGrouped and _G["DoiteGroup_Computed"] and _G["DoiteGroup_Computed"][data.group] then
-			local list = _G["DoiteGroup_Computed"][data.group]
-			for i=1, table.getn(list) do
-				local ge = list[i]
-				if ge.key == key and ge._computedPos then
-					posX = ge._computedPos.x
-					posY = ge._computedPos.y
-					size = ge._computedPos.size
-					break
-				end
-			end
-		end
+        -- 2) Otherwise prefer the persisted computed layout from the last layout tick
+        elseif isGrouped and _G["DoiteGroup_Computed"] and _G["DoiteGroup_Computed"][data.group] then
+            local list = _G["DoiteGroup_Computed"][data.group]
+            for i = 1, table.getn(list) do
+                local ge = list[i]
+                if ge.key == key and ge._computedPos then
+                    posX = ge._computedPos.x
+                    posY = ge._computedPos.y
+                    size = ge._computedPos.size
+                    break
+                end
+            end
+        end
 
-		if not posX then
-			if isGrouped and not isLeader then
-				-- keep current point; just use saved alpha/scale/size for visual consistency
-				local currentSize = (data and (data.iconSize or data.size)) or 36
-				size = size or currentSize
-				-- DO NOT SetPoint here for follower without computed pos (avoid snap-back)
-			else
-				-- ungrouped or leader: use saved offsets
-				posX = (data and (data.offsetX or data.x)) or 0
-				posY = (data and (data.offsetY or data.y)) or 0
-				size = size or (data and (data.iconSize or data.size)) or 36
-			end
-		end
+        if not posX then
+            if isGrouped and not isLeader then
+                -- keep current point; just use saved alpha/scale/size for visual consistency
+                local currentSize = (data and (data.iconSize or data.size)) or 36
+                size = size or currentSize
+                -- DO NOT SetPoint here for follower without computed pos (avoid snap-back)
+            else
+                -- ungrouped or leader: use saved offsets
+                posX = (data and (data.offsetX or data.x)) or 0
+                posY = (data and (data.offsetY or data.y)) or 0
+                size = size or (data and (data.iconSize or data.size)) or 36
+            end
+        end
 
         f:SetScale((data and data.scale) or 1)
         f:SetAlpha((data and data.alpha) or 1)
@@ -1721,32 +1798,24 @@ local function RefreshIcons()
             if posX ~= nil and posY ~= nil then
                 f:ClearAllPoints()
                 f:SetPoint("CENTER", UIParent, "CENTER", posX, posY)
-            else
             end
         end
 
-		-- Texture handling (with saved iconTexture fallback)
-		local cache = DA_Cache()
-		local displayName = (data and (data.displayName or data.name)) or key
-		local texToUse = entry.tex
-		  or cache[displayName]
-		  or (data and data.iconTexture)
+        -- Texture handling (with saved iconTexture fallback; no extra game queries here)
+        local cache       = DA_Cache()
+        local displayName = (data and (data.displayName or data.name)) or key
+        local texToUse    = entry.tex
+                          or cache[displayName]
+                          or (data and data.iconTexture)
 
+        if texToUse then
+            cache[displayName] = texToUse
+            if data and not data.iconTexture then
+                data.iconTexture = texToUse
+            end
+        end
 
-		if not texToUse and data and data.type == "Ability" then
-		  local slot = FindSpellBookSlot(displayName)
-		  if slot then texToUse = GetSpellTexture(slot, BOOKTYPE_SPELL) end
-		end
-
-		if texToUse then
-		  -- Keep a name-level cache and also stamp it on this entry so it persists
-		  cache[displayName] = texToUse
-		  if data and not data.iconTexture then
-			data.iconTexture = texToUse
-		  end
-		end
-
-		f.icon:SetTexture(texToUse or "Interface\\Icons\\INV_Misc_QuestionMark")
+        f.icon:SetTexture(texToUse or "Interface\\Icons\\INV_Misc_QuestionMark")
 
         -- Visibility: conditions OR slide … but the group limit and bucket Disable have final say
         local wantsFromConditions = (f._daShouldShow == true)
@@ -1774,7 +1843,10 @@ end
 
 -- Refresh list (group-aware, but still uses .order as the only truth)
 local function RefreshList()
-    local _, v
+    if DA_IsHardDisabled() then
+        return
+    end
+	local _, v
 
     -- Hide old rows & headers
     for _, v in pairs(spellButtons) do
@@ -2268,6 +2340,16 @@ addBtn:SetScript("OnClick", function()
       name = TitleCase(name)
   end
 
+  -- Detect pure numeric Buff/Debuff input as "spell ID mode"
+  local spellIdStr = nil
+  if (t == "Buff" or t == "Debuff") and not isSpecialHeader then
+      if string.match(name, "^(%d+)$") then
+          spellIdStr = name
+          -- UI label while don't yet know the real spell name
+          name = "Spell ID: " .. spellIdStr .. " (will update when seen)"
+      end
+  end
+
   -- Ability validation stays
   if t == "Ability" and not FindSpellBookSlot(name) then
     (DEFAULT_CHAT_FRAME or ChatFrame1):AddMessage("|cffff0000DoiteAuras:|r Spell not found in spellbook.")
@@ -2278,6 +2360,9 @@ addBtn:SetScript("OnClick", function()
   -- Buff/Debuff duplicate rule:
   -- Only allow ONE entry per (name,type) while NONE of the existing
   -- siblings have a texture yet (iconTexture or cache entry).
+  --
+  -- For spell ID entries this still groups by the visible label
+  -- "Spell ID: 12345 (will update when seen)".
   ----------------------------------------------------------------
   if t == "Buff" or t == "Debuff" then
       local cache   = DA_Cache()
@@ -2325,20 +2410,25 @@ addBtn:SetScript("OnClick", function()
 
   -- Create the DB entry (defaults filled later by EnsureDBEntry/DoiteEdit)
   DoiteAurasDB.spells[key] = {
-    order = nextOrder,
-    type  = t,
+    order       = nextOrder,
+    type        = t,
     displayName = name,
-    baseKey = baseKey,
-    uid = instanceIdx,
+    baseKey     = baseKey,
+    uid         = instanceIdx,
   }
 
   local entry = DoiteAurasDB.spells[key]
   local cache = DA_Cache()
 
+  -- If this was created by spell ID, persist it so DoiteConditions can resolve it by ID.
+  if spellIdStr then
+      entry.spellid = spellIdStr
+  end
+
   -- Auto-prime texture
   if t == "Ability" then
     local slot = FindSpellBookSlot(name)
-    if slot then
+    if slot and GetSpellTexture then
       local tex = GetSpellTexture(slot, BOOKTYPE_SPELL)
       if tex then
         cache[name]       = tex
@@ -2419,7 +2509,7 @@ local function DA_CreateMinimapButton()
   overlay:SetWidth(54); overlay:SetHeight(54)
   overlay:SetPoint("TOPLEFT", 0, 0)
 
-  -- Icon (your DA tga)
+  -- Icon (DA tga)
   local icon = btn:CreateTexture(nil, "BACKGROUND")
   icon:SetTexture("Interface\\AddOns\\DoiteAuras\\Textures\\doiteauras-icon")
   icon:SetTexCoord(0.05, 0.95, 0.05, 0.95)
@@ -2449,10 +2539,17 @@ local function DA_CreateMinimapButton()
 
   -- click: opens/close DoiteAuras
   btn:SetScript("OnClick", function()
-    if DoiteAurasFrame and DoiteAurasFrame:IsShown() then
+    if DA_IsHardDisabled and DA_IsHardDisabled() then
+      local cf = (DEFAULT_CHAT_FRAME or ChatFrame1)
+      if cf then
+        cf:AddMessage("|cff6FA8DCDoiteAuras:|r Disabled because required mods are missing (SuperWoW, Nampower, UnitXP SP3).")
+      end
+      return
+    end
+	if DoiteAurasFrame and DoiteAurasFrame:IsShown() then
       DoiteAurasFrame:Hide()
     else
-	-- center-on-open logic (keeps your Step #1 behavior)
+	-- center-on-open logic (keeps Step #1 behavior)
     if DoiteAurasFrame then
      DoiteAurasFrame:ClearAllPoints()
      DoiteAurasFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
@@ -2464,7 +2561,7 @@ local function DA_CreateMinimapButton()
   -- tooltip
   btn:SetScript("OnEnter", function()
     GameTooltip:SetOwner(btn, "ANCHOR_LEFT")
-    GameTooltip:AddLine("DOITEAURAS", 0.435, 0.659, 0.863) -- #6FA8DC
+    GameTooltip:AddLine("DOITEAURAS", 0.435, 0.659, 0.863) -- #6FA8DC = DoiteAuras color - personal note
     GameTooltip:AddLine("Click to open DoiteAuras", 1, 1, 1)
     GameTooltip:AddLine("Version: " .. tostring(DA_GetVersion()), 0.9, 0.9, 0.9)
     GameTooltip:Show()
@@ -2491,6 +2588,13 @@ SLASH_DOITEAURAS2="/doiteauras"
 SLASH_DOITEAURAS3="/doiteaura"
 SLASH_DOITEAURAS4="/doite"
 SlashCmdList["DOITEAURAS"] = function()
+  if DA_IsHardDisabled() then
+    local cf = (DEFAULT_CHAT_FRAME or ChatFrame1)
+    if cf then
+      cf:AddMessage("|cff6FA8DCDoiteAuras:|r Disabled because required mods are missing (SuperWoW, Nampower, UnitXP SP3).")
+    end
+    return
+  end
   if frame:IsShown() then
     frame:Hide()
   else
@@ -2508,7 +2612,7 @@ end
 local DA_PREFIX = "DOITEAURAS"
 
 local function DA_GetVersion_Safe()
-  -- Reuse your existing DA_GetVersion() if present (minimap section defines it)
+  -- Reuse existing DA_GetVersion() if present (minimap section defines it)
   if type(DA_GetVersion) == "function" then
     return DA_GetVersion() or "?"
   end
@@ -2599,7 +2703,7 @@ _daVer:SetScript("OnEvent", function()
 
   if string.sub(text, 1, 6) == "DA_ME:" then
     local other = string.sub(text, 7)
-    -- show who has what (your existing behavior)
+    -- show who has what (existing behavior)
     if cf then
       cf:AddMessage(string.format("|cff6FA8DCDoiteAuras:|r %s has %s (you: %s)", tostring(sender or "?"), tostring(other or "?"), tostring(mine)))
     end
@@ -2649,12 +2753,33 @@ _daLoad:RegisterEvent("RAID_ROSTER_UPDATE")
 
 _daLoad:SetScript("OnEvent", function()
   if event == "ADDON_LOADED" and arg1 == "DoiteAuras" then
-    -- 1s after load: print “loaded” line with version
+    -- 1s after load: run modern-mod check, then print either "loaded" or "missing" line
     DA_RunLater(1, function()
-      local v  = tostring(DA_GetVersion_Safe())
       local cf = (DEFAULT_CHAT_FRAME or ChatFrame1)
-      if cf then
+      if not cf then return end
+
+      local missing = DA_GetMissingRequiredMods()
+
+      if table.getn(missing) == 0 then
+        -- All required mods present → normal loaded message
+        local v = tostring(DA_GetVersion_Safe())
         cf:AddMessage("|cff6FA8DCDoiteAuras|r v"..v.." loaded. Use |cffffff00/da|r (or minimap icon).")
+      else
+        -- One or more missing → modern client requirement message
+        local list = table.concat(missing, ", ")
+        cf:AddMessage("|cff6FA8DCDoiteAuras:|r This addon requires SuperWoW, Nampower and UnitXP SP3 mods to modernize the 1.12 client. You are missing " .. list .. ".")
+        -- BLOCKER: after printing the message, hard-disable the addon
+        _G["DoiteAuras_HardDisabled"] = true
+
+        -- Hide config frame and any icons if they exist
+        if DoiteAurasFrame and DoiteAurasFrame.Hide then
+          DoiteAurasFrame:Hide()
+        end
+        if icons then
+          for _, f in pairs(icons) do
+            if f and f.Hide then f:Hide() end
+          end
+        end
       end
     end)
 
@@ -2681,6 +2806,7 @@ end)
 local updateFrame = CreateFrame("Frame")
 updateFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 updateFrame:SetScript("OnEvent", function()
+  if DA_IsHardDisabled and DA_IsHardDisabled() then return end
   if event == "PLAYER_ENTERING_WORLD" then RefreshIcons() end
 end)
 
@@ -2690,6 +2816,9 @@ DoiteAuras_RefreshList  = RefreshList
 DoiteAuras_RefreshIcons = RefreshIcons
 
 function DoiteAuras.GetAllCandidates()
+    if DA_IsHardDisabled and DA_IsHardDisabled() then
+        return {}
+    end   
     local list = {}
     local editKey = _G["DoiteEdit_CurrentKey"]
     local editFrame = _G["DoiteEdit_Frame"] or _G["DoiteEditMain"] or _G["DoiteEdit"]
@@ -2722,6 +2851,7 @@ end
 -- Ensure an icon frame exists for a given key (no visibility changes)
 function DoiteAuras_TouchIcon(key)
   if not key then return end
+  if DA_IsHardDisabled and DA_IsHardDisabled() then return end
   local name = "DoiteIcon_"..key
   if _G[name] then return end
   if CreateOrUpdateIcon then CreateOrUpdateIcon(key, 36) end

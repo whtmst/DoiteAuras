@@ -42,10 +42,22 @@ _isWarrior = false
 
 local function _GetSpellIndexByName(spellName)
     if not spellName then return nil end
+
     local cached = SpellIndexCache[spellName]
     if cached ~= nil then
         return (cached ~= false) and cached or nil
     end
+
+    -- Nampower fast path - GetSpellSlotTypeIdForName(spellName)
+    if GetSpellSlotTypeIdForName then
+        local slot, bookType = GetSpellSlotTypeIdForName(spellName)
+        if slot and slot > 0 and bookType == "spell" then
+            SpellIndexCache[spellName] = slot
+            return slot
+        end
+    end
+
+    -- Vanilla scan fallback
     local i = 1
     while i <= 200 do
         local s = GetSpellName(i, BOOKTYPE_SPELL)
@@ -56,6 +68,7 @@ local function _GetSpellIndexByName(spellName)
         end
         i = i + 1
     end
+
     SpellIndexCache[spellName] = false
     return nil
 end
@@ -79,6 +92,89 @@ local function _IsKeyUnderEdit(k)
     end
     return true
 end
+
+local function _IsAnyKeyUnderEdit()
+    local cur = _G["DoiteEdit_CurrentKey"]
+    if not cur then return false end
+    local f = _G["DoiteEdit_Frame"] or _G["DoiteEditMain"] or _G["DoiteEdit"]
+    if f and f.IsShown then
+        return f:IsShown() == 1
+    end
+    return false
+end
+
+local function _MaybeResolveSpellIdForEntry(key, data)
+    if not data or type(data) ~= "table" then return end
+
+    -- Only touch entries that look like the temporary "Spell ID: ###" displayName
+    local dn = data.displayName
+    if not dn or dn == "" then return end
+    if not str_find(dn, "^Spell ID") then
+        return
+    end
+
+    local sidStr = data.spellid
+    if not sidStr or sidStr == "" then return end
+    local sid = tonumber(sidStr)
+    if not sid or sid <= 0 then return end
+
+    local name, tex
+
+    -- SuperWoW: SpellInfo(spellId) -> name, rank, texture, ...
+    if SpellInfo then
+        local n, _, t = SpellInfo(sid)
+        if type(n) == "string" and n ~= "" then
+            name = n
+        end
+        if type(t) == "string" and t ~= "" then
+            tex = t
+        end
+    end
+
+    -- Nampower fallback: GetSpellNameAndRankForId(spellId)
+    if (not name) and GetSpellNameAndRankForId then
+        local n, rank = GetSpellNameAndRankForId(sid)
+        if type(n) == "string" and n ~= "" then
+            name = n
+        end
+    end
+
+    -- If still don’t have a real name, bail out without changing anything
+    if not name or name == "" then
+        return
+    end
+
+    ------------------------------------------------------------
+    -- Commit to DB: real name + optional texture
+    ------------------------------------------------------------
+    data.displayName = name
+    if not data.name or data.name == "" then
+        data.name = name
+    end
+
+    if tex and tex ~= "" then
+        data.iconTexture = tex
+
+        if IconCache then
+            IconCache[name] = tex
+        end
+        if DoiteAurasDB and DoiteAurasDB.cache then
+            DoiteAurasDB.cache[name] = tex
+        end
+
+        -- Update live icon frame if it exists
+        if key then
+            local f = _G["DoiteIcon_" .. key]
+            if f and f.icon and f.icon.SetTexture then
+                local cur = f.icon:GetTexture()
+                if cur ~= tex then
+                    f.icon:SetTexture(tex)
+                end
+            end
+        end
+    end
+end
+
 
 local _trackedByName, _trackedBuiltAt = nil, 0
 local function _GetTrackedByName()
@@ -107,6 +203,10 @@ local function _GetTrackedByName()
         local key, data
         for key, data in pairs(DoiteAurasDB.spells) do
             if data and (data.type == "Buff" or data.type == "Debuff") then
+                -- If this aura was added via spellid with a temporary "Spell ID: ###"
+                -- name, resolve it once here using SuperWoW / Nampower.
+                _MaybeResolveSpellIdForEntry(key, data)
+
                 local nm = data.displayName or data.name
                 if nm and nm ~= "" then
                     local lst = t[nm]
@@ -131,8 +231,16 @@ if not DoiteConditionsTooltip then
     DoiteConditionsTooltip = CreateFrame("GameTooltip", "DoiteConditionsTooltip", nil, "GameTooltipTemplate")
     DoiteConditionsTooltip:SetOwner(UIParent, "ANCHOR_NONE")
 end
-local auraSnapshot = { player = { buffs = {}, debuffs = {} }, target = { buffs = {}, debuffs = {} } }
+
+local auraSnapshot = {
+    player = { buffs = {}, debuffs = {}, buffIds = {}, debuffIds = {} },
+    target = { buffs = {}, debuffs = {}, buffIds = {}, debuffIds = {} },
+}
+
 _G.DoiteConditions_AuraSnapshot = auraSnapshot
+-- Per-name remaining-time cache for player auras (rebuilt on UNIT_AURA "player")
+local PlayerAuraTimers = { buffs = {}, debuffs = {} }
+_G.DoiteConditions_PlayerAuraTimers = PlayerAuraTimers
 
 -- Create hidden tooltip once; don't re-SetOwner every scan
 local function _EnsureTooltip()
@@ -147,172 +255,212 @@ local function _EnsureTooltip()
     end
 end
 
--- Tooltip-driven name fetch for a specific aura slot
+-- SuperWoW: UnitBuff/UnitDebuff return auraId, SpellInfo(auraId) gives name/texture.
 local function _GetAuraName(unit, index, isDebuff)
-    _EnsureTooltip()
     if not unit or not index or index < 1 then return nil end
 
-    -- First confirm this index actually has an aura using the documented API
-    local tex
+    local tex, auraId
     if isDebuff then
-        tex = UnitDebuff(unit, index)
+        -- SuperWoW: texture, stacks, dtype, spellID
+        tex, _, _, auraId = UnitDebuff(unit, index)
     else
-        tex = UnitBuff(unit, index)
+        -- SuperWoW: texture, stacks, spellID
+        tex, _, auraId = UnitBuff(unit, index)
     end
     if not tex then
+        -- No aura at this index: real end-of-list marker
         return nil
     end
 
-    DoiteConditionsTooltip:ClearLines()
-    if isDebuff then
-        DoiteConditionsTooltip:SetUnitDebuff(unit, index)
-    else
-        DoiteConditionsTooltip:SetUnitBuff(unit, index)
-    end
+    local name
 
-    -- Normal case: the template created DoiteConditionsTooltipTextLeft1
-    local fs1 = _G["DoiteConditionsTooltipTextLeft1"]
-    if fs1 and fs1.GetText then
-        local txt = fs1:GetText()
-        if txt and txt ~= "" then
-            return txt
+    -- SuperWoW path: auraId -> SpellInfo(id) -> name
+    if auraId and SpellInfo then
+        local n = SpellInfo(auraId)
+        if type(n) == "string" and n ~= "" then
+            name = n
         end
     end
 
-    -- Fallback: scan all left text lines just in case the template is odd
-    local i = 1
-    while true do
-        local fs = _G["DoiteConditionsTooltipTextLeft" .. i]
-        if not fs or not fs.GetText then
-            break
+    -- Fallback: tooltip name (vanilla / weird auras / bad IDs)
+    if not name then
+        _EnsureTooltip()
+        DoiteConditionsTooltip:ClearLines()
+
+        if isDebuff then
+            if DoiteConditionsTooltip.SetUnitDebuff then
+                DoiteConditionsTooltip:SetUnitDebuff(unit, index)
+            elseif DoiteConditionsTooltip.SetUnitBuff then
+                DoiteConditionsTooltip:SetUnitBuff(unit, index, "HARMFUL")
+            end
+        else
+            if DoiteConditionsTooltip.SetUnitBuff then
+                DoiteConditionsTooltip:SetUnitBuff(unit, index, "HELPFUL")
+            end
         end
-        local t = fs:GetText()
-        if t and t ~= "" then
-            return t
+
+        local fs = _G["DoiteConditionsTooltipTextLeft1"]
+        if fs and fs.GetText then
+            local t = fs:GetText()
+            if t and t ~= "" then
+                name = t
+            end
         end
-        i = i + 1
     end
 
-    return nil
+    -- return a non-nil sentinel so callers don't think the list ended.
+    if not name then
+        return ""
+    end
+
+    return name
 end
 
 local function _ScanUnitAuras(unit)
-    _EnsureTooltip()
-
-    -- Use the cached lookup: auraName -> { list of keys that track this name }
+    -- Use cached lookup: auraName -> { list of keys that track this name }
     local trackedByName = _GetTrackedByName()
 
-    local snap = auraSnapshot[unit]
-    if not snap then return end
-    local buffs, debuffs = snap.buffs, snap.debuffs
-    if not buffs or not debuffs then return end
+	local snap = auraSnapshot[unit]
+	if not snap then return end
+	local buffs,   debuffs   = snap.buffs,   snap.debuffs
+	local buffIds, debuffIds = snap.buffIds, snap.debuffIds
+	if not buffs or not debuffs then return end
 
-    -- Clear previous snapshot
-    for k in pairs(buffs) do buffs[k] = nil end
-    for k in pairs(debuffs) do debuffs[k] = nil end
+	-- Clear previous snapshot
+	for k in pairs(buffs)     do buffs[k]     = nil end
+	for k in pairs(debuffs)   do debuffs[k]   = nil end
+	if buffIds then
+		for k in pairs(buffIds)   do buffIds[k]   = nil end
+	end
+	if debuffIds then
+		for k in pairs(debuffIds) do debuffIds[k] = nil end
+	end
+
+    local cache = IconCache
 
     ----------------------------------------------------------------
     -- BUFFS
     ----------------------------------------------------------------
     local i = 1
-    while true do
-        -- Use the documented API to detect if this slot actually has a buff
-        local tex = UnitBuff(unit, i)
-        if not tex then
-            break -- no more buffs at this index
-        end
+	while true do
+		-- SuperWoW: texture, stacks, spellID
+		local tex, _, auraId = UnitBuff(unit, i)
+		if not tex then
+			break
+		end
 
-        -- Tooltip-based name lookup (safe even if tooltip has no text)
-        local tn = _GetAuraName(unit, i, false)
-        if tn and tn ~= "" then
-            buffs[tn] = true
+		local name
+		if auraId and SpellInfo then
+			name = SpellInfo(auraId)
+		end
 
-            local list = trackedByName and trackedByName[tn]
-            if list and type(list) == "table" then
-                if IconCache[tn] ~= tex then
-                    IconCache[tn] = tex
-                    DoiteAurasDB.cache[tn] = tex
+		if type(name) == "string" and name ~= "" then
+			buffs[name] = true
+			if buffIds and auraId then
+				buffIds[auraId] = true
+			end
 
-                    local count = table.getn(list)
-                    local j = 1
-                    while j <= count do
-                        local key = list[j]
+			local list = trackedByName and trackedByName[name]
+			if list and type(list) == "table" then
+				if cache[name] ~= tex then
+					cache[name] = tex
+					DoiteAurasDB.cache[name] = tex
 
-                        if key then
-                            -- 1) Update DB spell icon
-                            if DoiteAurasDB.spells then
-                                local s = DoiteAurasDB.spells[key]
-                                if s then
-                                    s.iconTexture = tex
-                                end
-                            end
+					local count = table.getn(list)
+					for j = 1, count do
+						local key = list[j]
+						if key and DoiteAurasDB.spells then
+							local s = DoiteAurasDB.spells[key]
+							if s then
+								-- 1) Update DB spell icon
+								s.iconTexture = tex
 
-                            -- 2) Update live icon frame texture
-                            local f = _G["DoiteIcon_" .. key]
-                            if f and f.icon and f.icon:GetTexture() ~= tex then
-                                f.icon:SetTexture(tex)
-                            end
-                        end
+								-- 1b) Auto-fill spellid if it's missing
+								if auraId and not s.spellid then
+									s.spellid = tostring(auraId)
+								end
 
-                        j = j + 1
-                    end
-                end
-            end
-        end
+								-- 1c) Backfill displayName if missing in config
+								if (not s.displayName or s.displayName == "") then
+									s.displayName = name
+								end
+							end
+						end
 
-        i = i + 1
-    end
+						-- 2) Update live icon frame texture
+						local f = _G["DoiteIcon_" .. key]
+						if f and f.icon and f.icon:GetTexture() ~= tex then
+							f.icon:SetTexture(tex)
+						end
+					end
+				end
+			end
+		end
+
+		i = i + 1
+	end
 
     ----------------------------------------------------------------
     -- DEBUFFS
     ----------------------------------------------------------------
-    i = 1
-    while true do
-        -- Same API, but debuffs
-        local tex = UnitDebuff(unit, i)
-        if not tex then
-            break -- no more debuffs at this index
-        end
+	i = 1
+	while true do
+		-- SuperWoW: texture, stacks, dtype, spellID
+		local tex, _, _, auraId = UnitDebuff(unit, i)
+		if not tex then
+			break
+		end
 
-        local tn = _GetAuraName(unit, i, true)
-        if tn and tn ~= "" then
-            debuffs[tn] = true
+		local name
+		if auraId and SpellInfo then
+			name = SpellInfo(auraId)
+		end
 
-            local list = trackedByName and trackedByName[tn]
-            if list and type(list) == "table" then
-                if IconCache[tn] ~= tex then
-                    IconCache[tn] = tex
-                    DoiteAurasDB.cache[tn] = tex
+		if type(name) == "string" and name ~= "" then
+			debuffs[name] = true
+			if debuffIds and auraId then
+				debuffIds[auraId] = true
+			end
 
-                    local count = table.getn(list)
-                    local j = 1
-                    while j <= count do
-                        local key = list[j]
+			local list = trackedByName and trackedByName[name]
+			if list and type(list) == "table" then
+				if cache[name] ~= tex then
+					cache[name] = tex
+					DoiteAurasDB.cache[name] = tex
 
-                        if key then
-                            -- 1) Update DB spell icon
-                            if DoiteAurasDB.spells then
-                                local s = DoiteAurasDB.spells[key]
-                                if s then
-                                    s.iconTexture = tex
-                                end
-                            end
+					local count = table.getn(list)
+					for j = 1, count do
+						local key = list[j]
+						if key and DoiteAurasDB.spells then
+							local s = DoiteAurasDB.spells[key]
+							if s then
+								-- 1) Update DB spell icon
+								s.iconTexture = tex
 
-                            -- 2) Update live icon frame texture
-                            local f = _G["DoiteIcon_" .. key]
-                            if f and f.icon and f.icon:GetTexture() ~= tex then
-                                f.icon:SetTexture(tex)
-                            end
-                        end
+								-- 1b) Auto-fill spellid if it's missing
+								if auraId and not s.spellid then
+									s.spellid = tostring(auraId)
+								end
 
-                        j = j + 1
-                    end
-                end
-            end
-        end
+								-- 1c) Backfill displayName if missing
+								if (not s.displayName or s.displayName == "") then
+									s.displayName = name
+								end
+							end
+						end
 
-        i = i + 1
-    end
+						-- 2) Update live icon frame texture
+						local f = _G["DoiteIcon_" .. key]
+						if f and f.icon and f.icon:GetTexture() ~= tex then
+							f.icon:SetTexture(tex)
+						end
+					end
+				end
+			end
+		end
+
+		i = i + 1
+	end
 
     if dirty_aura and DoiteAurasDB and DoiteAurasDB.cache then
         DoiteAurasDB.cache = IconCache
@@ -387,18 +535,43 @@ local function _AbilityCooldownByName(spellName)
     end
 end
 
+-- Nampower-accelerated cache: spellName -> spellId (max rank)
+local SpellUsableIdCache = {}
+
 -- NamPower-safe wrapper around IsSpellUsable.
 local function _SafeSpellUsable(spellNameBase, spellIndex, bookType)
-    -- If there is no IsSpellUsable at all (very old client), just pretend usable.
     if not IsSpellUsable or not spellNameBase then
         return 1, 0
     end
 
+    ----------------------------------------------------------------
+    -- 1) Fast path: Nampower present -> spellId + IsSpellUsable(id)
+    ----------------------------------------------------------------
+    if GetSpellIdForName then
+        local sid = SpellUsableIdCache[spellNameBase]
+
+        if sid == nil then
+            sid = GetSpellIdForName(spellNameBase)
+            SpellUsableIdCache[spellNameBase] = sid or false
+        end
+
+        if sid and sid ~= 0 then
+            local ok, u, noMana = pcall(IsSpellUsable, sid)
+            if ok and u ~= nil then
+                return u, noMana
+            end
+        end
+        -- fall through to legacy if no valid id / pcall fail
+    end
+
+    ----------------------------------------------------------------
+    -- 2) Legacy fallback: old string-based behaviour (rarely used)
+    ----------------------------------------------------------------
     local bt  = bookType or BOOKTYPE_SPELL
     local arg = spellNameBase
 
-    -- Try to build "Name(Rank X)" from the *highest* rank seen in the spellbook
     if GetSpellName and spellIndex then
+        -- Only build the rank string once per *spellIndex*
         local idxForRank = spellIndex
         local i = spellIndex + 1
         while i <= 200 do
@@ -412,26 +585,23 @@ local function _SafeSpellUsable(spellNameBase, spellIndex, bookType)
 
         local n, r = GetSpellName(idxForRank, bt)
         if n and r and r ~= "" then
-            -- Example: n = "Barkskin (Feral)", r = "Rank 3"
-            -- -> "Barkskin (Feral)(Rank 3)"
             arg = n .. "(" .. r .. ")"
         end
     end
 
-    -- 1) Preferred: call IsSpellUsable("Name(Rank X)")
+    -- 2a) Preferred legacy call
     local ok, u, noMana = pcall(IsSpellUsable, arg)
     if ok and u ~= nil then
         return u, noMana
     end
 
-    -- 2) Fallback: original behaviour, plain name. If this errors (NamPower)
+    -- 2b) Last resort: plain name (old behaviour)
     ok, u, noMana = pcall(IsSpellUsable, spellNameBase)
     if ok and u ~= nil then
         return u, noMana
     end
 
-    -- 3) Last resort: treat as usable so the icon doesn't die forever because of
-    --    a bad name/id in some edge case.
+    -- 3) Ultimate fallback: treat as usable so icon doesn’t die forever
     return 1, 0
 end
 
@@ -452,7 +622,7 @@ local function _SlotIndexForName(name)
 end
 
 -- Per-key memory for TRINKET_FIRST: "first ready wins" and stays the winner
-local _TrinketFirstMemory = {}  -- [itemKey] = { slot = INV_SLOT_TRINKET1 or INV_SLOT_TRINKET2 }
+local _TrinketFirstMemory = {}
 
 local function _ClearTrinketFirstMemory()
     for k in pairs(_TrinketFirstMemory) do
@@ -580,22 +750,27 @@ local function _GetInventorySlotState(slot)
 end
 
 -- Core item state used by both condition checks and text overlays
--- c is data.conditions.item
--- Returns table:
---   hasItem     : bool (at least one matching/equipped item or slot)
---   isMissing   : bool (no such item/slot present)
---   passesWhere : bool (Whereabouts / slot conditions satisfied)
---   modeMatches : bool (mode "oncd"/"notcd" satisfied, or true if no mode)
---   rem, dur    : cooldown remaining / duration (nil if not applicable)
+local _ItemStateScratch = {
+    hasItem     = false,
+    isMissing   = false,
+    passesWhere = true,
+    modeMatches = true,
+    rem         = nil,
+    dur         = nil,
+}
+
+local function _ResetItemState(state)
+    state.hasItem     = false
+    state.isMissing   = false
+    state.passesWhere = true
+    state.modeMatches = true
+    state.rem         = nil
+    state.dur         = nil
+end
+
 local function _EvaluateItemCoreState(data, c)
-    local state = {
-        hasItem     = false,
-        isMissing   = false,
-        passesWhere = true,
-        modeMatches = true,
-        rem         = nil,
-        dur         = nil,
-    }
+    local state = _ItemStateScratch
+    _ResetItemState(state)
 
     if not data or not c then
         return state
@@ -652,8 +827,6 @@ local function _EvaluateItemCoreState(data, c)
 
             if invSlotName == "TRINKET_FIRST" then
                 -- “First ready” semantics with memory per key:
-                --   * Track which slot won first.
-                --   * Keep that winner while it stays valid.
                 local prevSlot = key
                                   and _TrinketFirstMemory[key]
                                   and _TrinketFirstMemory[key].slot
@@ -706,7 +879,6 @@ local function _EvaluateItemCoreState(data, c)
 
                 elseif mode == "oncd" then
                     -- On-CD mode: any usable trinket on cooldown passes; pick the one
-                    -- with the smaller remaining CD (first to finish).
                     local found, bestRem, bestDur = false, nil, nil
 
                     if use1 and on1 then
@@ -866,188 +1038,152 @@ local function _EvaluateItemCoreState(data, c)
     return state
 end
 
-
-
 -- =================================================================
 -- Lightweight Combat Log Watcher
 -- =================================================================
-_G["Doite_LastUsedSpell"] = _G["Doite_LastUsedSpell"] or nil
-_G["Doite_LastUsedAt"]    = _G["Doite_LastUsedAt"]    or 0
+
+-- For slider gating: which spells have we actually seen cast?
+_G["Doite_SliderSeen"] = _G["Doite_SliderSeen"] or {}
+local _SliderSeen = _G["Doite_SliderSeen"]
+
+local function _MarkSliderSeen(spellName)
+    if not spellName or spellName == "" then return end
+    _SliderSeen[spellName] = GetTime() or 0
+end
 
 local _OP_until, _OP_target = 0, nil
 local _REV_until            = 0
 
 local function _Now() return GetTime() or 0 end
 
--- =================================================================
--- Shared cooldown spell list
--- Only spells in this table use cooldown "ownership" gating.
--- Everything else just slides based on its raw cooldown.
--- =================================================================
-local SharedCooldownSpells = {
-    -- Warrior reactive procs
-    ["Overpower"]     = true,
-    ["Revenge"]       = true,
-
-    -- Warrior big 30 min buttons (all share a CD)
-    ["Shield Wall"]   = true,
-    ["Retaliation"]   = true,
-    ["Recklessness"]  = true,
-
-    -- Hunter traps – share the trap cooldown
-    ["Immolation Trap"] = true,
-    ["Explosive Trap"]  = true,
-    ["Frost Trap"]      = true,
-    ["Freezing Trap"]   = true,
-
-    -- Shaman shocks – share the shock cooldown
-    ["Earth Shock"]   = true,
-    ["Flame Shock"]   = true,
-    ["Frost Shock"]   = true,
-
-    -- Paladin – share cooldown
-	["Crusader Strike"]	= true,
-	["Holy Strike"]		= true,
-}
-
-local function _IsSharedCooldownSpell(spellName)
-    return spellName and SharedCooldownSpells[spellName] == true
+-- Canonical ability name resolver (spellbook name preferred)
+local function _GetCanonicalSpellNameFromData(data)
+    if not data or type(data) ~= "table" then return nil end
+    if data.name and data.name ~= "" then
+        -- This is the canonical spellbook name (what GetSpellName sees)
+        return data.name
+    end
+    if data.displayName and data.displayName ~= "" then
+        return data.displayName
+    end
+    return nil
 end
 
 -- =================================================================
--- Per-spell cooldown ownership (for shared cooldowns)
+-- SuperWoW: UNIT_CASTEVENT -> last used spell + cooldown ownership
 -- =================================================================
-local _CooldownOwners = {}  -- [spellName] = { untilTime = number }
+local _playerGUID_cached = nil
+local _GetUnitGuid -- forward declaration so _GetPlayerGUID sees the local
 
-local function _CooldownOwner_Set(spellName)
-    if not spellName then return end
+local function _GetPlayerGUID()
+    if _playerGUID_cached then
+        return _playerGUID_cached
+    end
 
-    -- Only shared-cooldown spells care about ownership.
-    if not _IsSharedCooldownSpell(spellName) then
+    local guid = _GetUnitGuid and _GetUnitGuid("player") or nil
+    if guid and guid ~= "" then
+        _playerGUID_cached = guid
+        return guid
+    end
+    return nil
+end
+
+local _daCast = CreateFrame("Frame")
+_daCast:RegisterEvent("UNIT_CASTEVENT")
+_daCast:SetScript("OnEvent", function()
+    local casterGUID = arg1
+    local targetGUID = arg2
+    local evType     = arg3
+    local spellId    = arg4
+    local duration   = arg5
+
+    local pGUID = _GetPlayerGUID()
+    if not pGUID or casterGUID ~= pGUID then
         return
     end
 
-    local rem, dur = _AbilityCooldownByName(spellName)
-    if not rem or not dur or dur <= 1.5 or rem <= 0 then
-        _CooldownOwners[spellName] = nil
+    -- Only care about completed casts / swings for "last used spell".
+    if evType ~= "CAST" and evType ~= "MAINHAND" and evType ~= "OFFHAND" then
         return
     end
 
-    local st = _CooldownOwners[spellName] or {}
-    st.untilTime = GetTime() + rem
-    _CooldownOwners[spellName] = st
-end
-
-local function _CooldownOwner_IsOwned(spellName)
-    local st = _CooldownOwners[spellName]
-    if not st or not st.untilTime then return false end
-
-    if st.untilTime <= GetTime() then
-        _CooldownOwners[spellName] = nil
-        return false
+    if not spellId or not SpellInfo then
+        return
     end
-    return true
-end
+
+    local name = SpellInfo(spellId)
+    if type(name) ~= "string" or name == "" then
+        return
+    end
+
+    local now = _Now() or 0
+
+    -- Slider gating: only allow sliders for spells actually seen cast.
+    if evType == "CAST" then
+        _MarkSliderSeen(name)
+    end
+end)
 
 local function _CL_Parse(msg)
-    -- Record last used spell (kept for other features)
-       do
-        local gained =
-              str_match(msg, "^You gain (.+)%.$")
-           or str_match(msg, "^You gain (.+) %(%d+%)%.$")
-           or str_match(msg, "^You are afflicted by (.+)%.$")
-           or str_match(msg, "^You are afflicted by (.+) %(%d+%)%.$")
-
-        if gained then
-            -- Strip trailing " (1)" etc if it sneaks into the capture
-            gained = str_gsub(gained, "%s*%(%d+%)$", "")
-
-            local idx = _GetSpellIndexByName(gained)
-            if idx then
-                _G["Doite_LastUsedSpell"] = gained
-                _G["Doite_LastUsedAt"]    = _Now()
-                _CooldownOwner_Set(gained)
-            end
-        end
-    end
-
-   do
-        local n = str_match(msg, "^Your%s+(.+)%s+hits")
-              or str_match(msg, "^Your%s+(.+)%s+crits")
-              or str_match(msg, "^Your%s+(.+)%s+misses")
-              or str_match(msg, "^Your%s+(.+)%s+is%s+absorbed")
-              or str_match(msg, "^Your%s+(.+)%s+was%s+dodged")
-              or str_match(msg, "^Your%s+(.+)%s+was%s+parried")
-        if n then
-            _G["Doite_LastUsedSpell"] = n
-            _G["Doite_LastUsedAt"] = _Now()
-
-            -- Also mark that THIS spell owns its current cooldown (if any)
-            _CooldownOwner_Set(n)
-        end
-    end
-
     -- Warrior-only reactive proc parsing (Overpower / Revenge)
     if _isWarrior then
-        -- Overpower proc: target dodges your attack/ability (5s, target-locked)
         do
-            local tgt = str_match(msg, "^You attack%.%s+(.+)%s+dodges%.")
-                    or str_match(msg, "^Your%s+.+%s+was%s+dodged%s+by%s+(.+)%.")
+            local tgt =
+                str_match(msg, "You attack%.%s+(.+)%s+dodges")
+                or str_match(msg, "Your%s+.+%s+was%s+dodged%s+by%s+(.+)")
             if tgt then
                 _OP_target = tgt
-                _OP_until  = _Now() + 5.0
-                -- Force ability re-evaluation so Overpower icons update immediately
+                _OP_until  = _Now() + 4.0
                 dirty_ability = true
             end
         end
 
+        -- Revenge proc: you dodge/parry/block or take a partially blocked hit
         if str_find(msg, "You dodge")
            or str_find(msg, "You parry")
            or str_find(msg, "You block")
            or ((str_find(msg, " hits you for ") or str_find(msg, " crits you for "))
                and str_find(msg, " blocked)")) then
-            _REV_until = _Now() + 5.0
+            _REV_until = _Now() + 4.0
             dirty_ability = true
         end
     end
 end
 
--- Minimal listener: include “hits” so partial blocks like "(xx blocked)" are seen
-local _daCL = CreateFrame("Frame")
-_daCL:RegisterEvent("CHAT_MSG_SPELL_SELF_DAMAGE")
-_daCL:RegisterEvent("CHAT_MSG_SPELL_SELF_MISSES")
-_daCL:RegisterEvent("CHAT_MSG_COMBAT_SELF_MISSES")
-_daCL:RegisterEvent("CHAT_MSG_SPELL_SELF_BUFF")
-_daCL:RegisterEvent("CHAT_MSG_SPELL_PERIODIC_SELF_BUFFS")
-_daCL:RegisterEvent("CHAT_MSG_SPELL_PERIODIC_SELF_DAMAGE")
-_daCL:RegisterEvent("CHAT_MSG_COMBAT_CREATURE_VS_SELF_MISSES")
-_daCL:RegisterEvent("CHAT_MSG_COMBAT_CREATURE_VS_SELF_HITS")
-_daCL:RegisterEvent("CHAT_MSG_SPELL_CREATURE_VS_SELF_DAMAGE")
-_daCL:SetScript("OnEvent", function()
-    local m = arg1
-    if not m or m == "" then return end
+-- SuperWoW: RAW_COMBATLOG gives the original event name + raw text
+local _daRawCL = CreateFrame("Frame")
 
-    -- Fast pre-filter: if the line doesn't even mention "You" or "Your"
-    if not str_find(m, "You ") and not str_find(m, "Your ") then
+-- SuperWoW: RAW_COMBATLOG fires for all combat lines
+_daRawCL:RegisterEvent("RAW_COMBATLOG")
+_daRawCL:RegisterEvent("CHAT_MSG_COMBAT_SELF_MISSES")
+_daRawCL:RegisterEvent("CHAT_MSG_COMBAT_CREATURE_VS_SELF_MISSES")
+_daRawCL:RegisterEvent("CHAT_MSG_COMBAT_CREATURE_VS_SELF_HITS")
+_daRawCL:RegisterEvent("CHAT_MSG_SPELL_SELF_MISSES")
+_daRawCL:RegisterEvent("CHAT_MSG_SPELL_SELF_DAMAGE")
+_daRawCL:RegisterEvent("CHAT_MSG_SPELL_SELF_BUFF")
+_daRawCL:RegisterEvent("CHAT_MSG_SPELL_PERIODIC_SELF_BUFFS")
+_daRawCL:RegisterEvent("CHAT_MSG_SPELL_PERIODIC_SELF_DAMAGE")
+
+_daRawCL:SetScript("OnEvent", function()
+    local line
+
+    if event == "RAW_COMBATLOG" then
+        -- SuperWoW: arg1 = original event name, arg2 = text with GUIDs
+        line = arg2
+    else
+        -- Classic CHAT_MSG_* events: arg1 is the human-readable line
+        line = arg1
+    end
+
+    if not line or line == "" then return end
+
+    -- Fast pre-filter: only care about lines involving the player
+    if not str_find(line, "You ") and not str_find(line, "Your ") then
         return
     end
 
-    _CL_Parse(m)
+    _CL_Parse(line)
 end)
-
-local function _UpdateCombatLogRegistration()
-    if not _daCL then return end
-
-    if _isWarrior then
-        _daCL:RegisterEvent("CHAT_MSG_COMBAT_CREATURE_VS_SELF_MISSES")
-        _daCL:RegisterEvent("CHAT_MSG_COMBAT_CREATURE_VS_SELF_HITS")
-        _daCL:RegisterEvent("CHAT_MSG_SPELL_CREATURE_VS_SELF_DAMAGE")
-    else
-        _daCL:UnregisterEvent("CHAT_MSG_COMBAT_CREATURE_VS_SELF_MISSES")
-        _daCL:UnregisterEvent("CHAT_MSG_COMBAT_CREATURE_VS_SELF_HITS")
-        _daCL:UnregisterEvent("CHAT_MSG_SPELL_CREATURE_VS_SELF_DAMAGE")
-    end
-end
 
 -- Helpers consumed by ability-usable override
 function _Warrior_Overpower_OK()
@@ -1060,6 +1196,24 @@ end
 function _Warrior_Revenge_OK()
     return _Now() <= _REV_until
 end
+
+-- Remaining proc-window time for Overpower / Revenge (seconds), or nil if no proc
+local function _WarriorProcRemainingForSpell(spellName)
+    if not _isWarrior or not spellName then return nil end
+    local now = _Now()
+
+    if spellName == "Overpower" then
+        local rem = _OP_until - now
+        if rem and rem > 0 then return rem end
+
+    elseif spellName == "Revenge" then
+        local rem = _REV_until - now
+        if rem and rem > 0 then return rem end
+    end
+
+    return nil
+end
+
 
 ----------------------------------------------------------------
 -- DoiteAuras Slide Manager (buttery-smooth 60fps animator)
@@ -1175,44 +1329,18 @@ end
 -- Player-only aura remaining (seconds); nil if not timed / not found
 local function _PlayerAuraRemainingSeconds(auraName)
     if not auraName then return nil end
-    if not GetPlayerBuff or not GetPlayerBuffTimeLeft or not DoiteConditionsTooltip then
+    if not PlayerAuraTimers then return nil end
+
+    local now = GetTime()
+    local t = PlayerAuraTimers.buffs[auraName] or PlayerAuraTimers.debuffs[auraName]
+    if not t then
         return nil
     end
 
-    -- search helpful first
-    for i = 0, 31 do
-        local idx = GetPlayerBuff(i, "HELPFUL")
-        if idx and idx >= 0 then
-            DoiteConditionsTooltip:ClearLines()
-            if DoiteConditionsTooltip.SetPlayerBuff then
-                DoiteConditionsTooltip:SetPlayerBuff(idx)
-                local tn = DoiteConditionsTooltipTextLeft1 and DoiteConditionsTooltipTextLeft1:GetText()
-                if tn == auraName then
-                    local tl = GetPlayerBuffTimeLeft(idx)
-                    if tl and tl > 0 then return tl end
-                    return nil
-                end
-            end
-        end
+    local rem = t - now
+    if rem > 0 then
+        return rem
     end
-
-    -- then harmful
-    for i = 0, 31 do
-        local idx = GetPlayerBuff(i, "HARMFUL")
-        if idx and idx >= 0 then
-            DoiteConditionsTooltip:ClearLines()
-            if DoiteConditionsTooltip.SetPlayerBuff then
-                DoiteConditionsTooltip:SetPlayerBuff(idx)
-                local tn = DoiteConditionsTooltipTextLeft1 and DoiteConditionsTooltipTextLeft1:GetText()
-                if tn == auraName then
-                    local tl = GetPlayerBuffTimeLeft(idx)
-                    if tl and tl > 0 then return tl end
-                    return nil
-                end
-            end
-        end
-    end
-
     return nil
 end
 
@@ -1223,12 +1351,12 @@ local function _HasCursive()
             and Cursive.curses.TimeRemaining) and true or false
 end
 
-local function _GetUnitGuid(unit)
+_GetUnitGuid = function(unit)
     if not unit or type(UnitExists) ~= "function" then
         return nil
     end
 
-    -- Turtle: UnitExists(unit) returns existsFlag, guid, ...
+    -- UnitExists(unit) returns existsFlag, guid
     local exists, guid = UnitExists(unit)
     if exists and guid and guid ~= "" then
         return guid
@@ -1291,35 +1419,22 @@ local function _CursiveRemainingPass(spellName, unit, comp, threshold)
     return _RemainingPasses(rem, comp, threshold)
 end
 
--- === AuraConditions helpers (Ability/Aura/Item) ==========================
 local function _AuraConditions_UnitHasAura(unit, auraName, wantDebuff)
     if not unit or not auraName then return false end
     if unit == "target" and (not UnitExists("target")) then
-        -- If require a target but none exists, treat as not-found.
         return false
     end
 
-    local i = 1
-    while true do
-        local tex
-        if wantDebuff then
-            tex = UnitDebuff(unit, i)
-        else
-            tex = UnitBuff(unit, i)
-        end
-        if not tex then
-            -- UnitBuff/UnitDebuff returned nil => no more auras
-            break
-        end
+    local snap = auraSnapshot[unit]
+    if not snap then return false end
 
-        -- Tooltip-based name resolution
-        local n = _GetAuraName(unit, i, wantDebuff)
-        if n == auraName then
-            return true
-        end
-        i = i + 1
+    if wantDebuff then
+        local d = snap.debuffs
+        return d and d[auraName] == true
+    else
+        local b = snap.buffs
+        return b and b[auraName] == true
     end
-    return false
 end
 
 local function _AuraConditions_CheckEntry(entry)
@@ -1405,23 +1520,33 @@ local function _StacksPasses(cnt, comp, target)
     return true
 end
 
--- Get stack count for a named aura on a unit (works for player/target on Turtle)
--- Returns a number (>=1) if found, or nil if not found.
+-- Get stack count for a named aura on a unit (works for player/target)
 local function _GetAuraStacksOnUnit(unit, auraName, wantDebuff)
     if not unit or not auraName then return nil end
+
     local i = 1
     while i <= 40 do
-        local n = _GetAuraName(unit, i, wantDebuff)
-        if not n then break end
-        if n == auraName then
-            if wantDebuff then
-				local _, applications = UnitDebuff(unit, i)
-				return applications or 1
-			else
-				local _, applications = UnitBuff(unit, i)
-				return applications or 1
-			end
+        local tex, applications, auraId
+        if wantDebuff then
+            -- texture, stacks, dtype, spellID
+            tex, applications, _, auraId = UnitDebuff(unit, i)
+        else
+            -- texture, stacks, spellID
+            tex, applications, auraId = UnitBuff(unit, i)
         end
+        if not tex then
+            break
+        end
+
+        local name
+        if auraId and SpellInfo then
+            name = SpellInfo(auraId)
+        end
+
+        if name == auraName then
+            return applications or 1
+        end
+
         i = i + 1
     end
     return nil
@@ -1431,33 +1556,16 @@ end
 local function _UnitHasAnyBuffName(unit, names)
     if not unit or not names then return false end
 
-    -- 1) Snapshot
     local snap = auraSnapshot[unit]
-    if snap and snap.buffs then
-        for i = 1, table.getn(names) do
-            if snap.buffs[names[i]] then
-                return true
-            end
+    local b = snap and snap.buffs
+    if not b then return false end
+
+    local n = table.getn(names)
+    for i = 1, n do
+        if b[names[i]] then
+            return true
         end
     end
-
-    -- 2) Live probe (tooltip-named), using the same UnitBuff-driven bounds
-    local i = 1
-    while true do
-        local tex = UnitBuff(unit, i)
-        if not tex then break end
-
-        local n = _GetAuraName(unit, i, false)
-        if n then
-            for j = 1, table.getn(names) do
-                if n == names[j] then
-                    return true
-                end
-            end
-        end
-        i = i + 1
-    end
-
     return false
 end
 
@@ -1702,7 +1810,57 @@ local function _EnsureAuraTexture(frame, data)
     local name = data.displayName or data.name
     if not c or not name or name == "" then return end
 
-    -- Current texture and cache
+    -- 0a) If config already has a spellid, trust SpellInfo(spellid) first.
+    if data.spellid and SpellInfo then
+        local sid = tonumber(data.spellid)
+        if sid and sid > 0 then
+            local _, _, tex = SpellInfo(sid)
+            if tex and tex ~= "" then
+                local cur = icon:GetTexture()
+                if cur ~= tex then
+                    icon:SetTexture(tex)
+                end
+
+                IconCache[name] = tex
+                if DoiteAurasDB and DoiteAurasDB.cache then
+                    DoiteAurasDB.cache[name] = tex
+                end
+                if DoiteAurasDB and DoiteAurasDB.spells and data.key and DoiteAurasDB.spells[data.key] then
+                    DoiteAurasDB.spells[data.key].iconTexture = tex
+                end
+                return
+            end
+        end
+    end
+
+    -- 0b) If Nampower is present and this spell exists in player spellbook, resolve name -> spellId -> texture even if no one has the aura up.
+    if GetSpellIdForName and SpellInfo then
+        local sid = GetSpellIdForName(name)
+        if sid and sid > 0 then
+            local _, _, tex = SpellInfo(sid)
+            if tex and tex ~= "" then
+                local cur = icon:GetTexture()
+                if cur ~= tex then
+                    icon:SetTexture(tex)
+                end
+
+                IconCache[name] = tex
+                if DoiteAurasDB and DoiteAurasDB.cache then
+                    DoiteAurasDB.cache[name] = tex
+                end
+                if DoiteAurasDB and DoiteAurasDB.spells and data.key and DoiteAurasDB.spells[data.key] then
+                    local s = DoiteAurasDB.spells[data.key]
+                    s.iconTexture = tex
+                    if not s.spellid then
+                        s.spellid = tostring(sid)
+                    end
+                end
+                return
+            end
+        end
+    end
+
+    -- 1) Existing cache / placeholder logic (unchanged)
     local curTex  = icon:GetTexture()
     local cached  = IconCache and IconCache[name] or nil
     local isPlaceholder = (curTex == nil)
@@ -1719,7 +1877,7 @@ local function _EnsureAuraTexture(frame, data)
         return
     end
 
-    -- Resolve unit(s) to scan, same semantics as before
+    -- 2) Existing live aura + spellbook scan (your old code)
     local tgt = c.target or (c.targetSelf and "self") or (c.targetTarget and "target") or "self"
     local checkSelf, checkTarget = false, false
     if tgt == "self" then
@@ -1734,12 +1892,14 @@ local function _EnsureAuraTexture(frame, data)
     end
 
     local function tryUnit(unit)
-        -- 1) BUFFS: confirm NAME via tooltip, then take TEXTURE from UnitBuff
+        -- 1) BUFFS: confirm NAME via SpellInfo/tooltip, then take TEXTURE from UnitBuff
         local i = 1
         while i <= 40 do
             local n = _GetAuraName(unit, i, false)
-            if not n then break end
-            if n == name then
+            if n == nil then
+                break
+            end
+            if n ~= "" and n == name then
                 local tex = UnitBuff(unit, i)
                 if tex and (isPlaceholder or curTex ~= tex) then
                     icon:SetTexture(tex)
@@ -1753,12 +1913,14 @@ local function _EnsureAuraTexture(frame, data)
             i = i + 1
         end
 
-        -- 2) DEBUFFS: confirm NAME via tooltip, then take TEXTURE from UnitDebuff
+        -- 2) DEBUFFS: confirm NAME via SpellInfo/tooltip, then take TEXTURE from UnitDebuff
         i = 1
         while i <= 40 do
             local n = _GetAuraName(unit, i, true)
-            if not n then break end
-            if n == name then
+            if n == nil then
+                break
+            end
+            if n ~= "" and n == name then
                 local tex = UnitDebuff(unit, i)
                 if tex and (isPlaceholder or curTex ~= tex) then
                     icon:SetTexture(tex)
@@ -1904,10 +2066,27 @@ local function _IconHasTimeLogic_Item(data)
     return false
 end
 
+-- Does a Buff/Debuff icon use any time-based features?
+local function _IconHasTimeLogic_Aura(data)
+    if not data or not data.conditions or not data.conditions.aura then
+        return false
+    end
+    local c = data.conditions.aura
+    if c.textTimeRemaining == true then
+        return true
+    end
+    if c.remainingEnabled == true then
+        return true
+    end
+    return false
+end
+
 -- Global flag: have ANY ability/item icons that need the 0.5s heartbeat?
 _hasAnyAbilityTimeLogic = false
+-- Global flag: have ANY aura icons that need the 0.5s heartbeat?
+_hasAnyAuraTimeLogic    = false
 -- Global flag: do we have ANY reason to track target auras at all?
-_hasAnyTargetAuraUsage = true
+_hasAnyTargetAuraUsage  = true
 
 local function _RebuildAbilityTimeHeartbeatFlag()
     _hasAnyAbilityTimeLogic = false
@@ -1938,6 +2117,36 @@ local function _RebuildAbilityTimeHeartbeatFlag()
                     return
                 elseif data.type == "Item" and _IconHasTimeLogic_Item(data) then
                     _hasAnyAbilityTimeLogic = true
+                    return
+                end
+            end
+        end
+    end
+end
+
+local function _RebuildAuraTimeHeartbeatFlag()
+    _hasAnyAuraTimeLogic = false
+
+    -- 1) Runtime icons
+    if DoiteAurasDB and DoiteAurasDB.spells then
+        local key, data
+        for key, data in pairs(DoiteAurasDB.spells) do
+            if type(data) == "table" and (data.type == "Buff" or data.type == "Debuff") then
+                if _IconHasTimeLogic_Aura(data) then
+                    _hasAnyAuraTimeLogic = true
+                    return
+                end
+            end
+        end
+    end
+
+    -- 2) Editor-only icons
+    if DoiteDB and DoiteDB.icons then
+        local key, data
+        for key, data in pairs(DoiteDB.icons) do
+            if type(data) == "table" and (data.type == "Buff" or data.type == "Debuff") then
+                if _IconHasTimeLogic_Aura(data) then
+                    _hasAnyAuraTimeLogic = true
                     return
                 end
             end
@@ -2032,7 +2241,7 @@ local function CheckAbilityConditions(data)
     local show = true
 
     -- === 1. Cooldown / usability ===
-    local spellName = data.displayName or data.name
+    local spellName  = _GetCanonicalSpellNameFromData(data)
     local spellIndex = _GetSpellIndexByName(spellName)
     local bookType = BOOKTYPE_SPELL
     local foundInBook = (spellIndex ~= nil)
@@ -2136,7 +2345,7 @@ local function CheckAbilityConditions(data)
 	if allowHelp or allowHarm or allowSelf then
 		ok = false
 
-		-- Self: must be explicitly targeting yourself
+		-- Self: must be explicitly targeting player
 		if allowSelf and UnitExists("target") and UnitIsUnit("player","target") then
 			ok = true
 		end
@@ -2238,8 +2447,6 @@ local function CheckAbilityConditions(data)
     end
 
     -- === Remaining (cooldown time left) ===
-    -- Only meaningful when the spell is actually on cooldown, and only when THIS
-    -- spell started that cooldown (shared CDs won't spam each other).
     if c.remainingEnabled
        and c.remainingComp and c.remainingComp ~= ""
        and c.remainingVal  ~= nil and c.remainingVal  ~= "" then
@@ -2248,23 +2455,16 @@ local function CheckAbilityConditions(data)
         if threshold then
             local rem = _AbilityRemainingSeconds(spellIndex, bookType)
 
-            -- Only apply the comparison if:
-            --   1) the spell has a real remaining time, and
-            --   2) this spell owns the cooldown (was the one actually cast).
-            local spellName = data.displayName or data.name
-			local useOwnership = _IsSharedCooldownSpell(spellName)
-			local ownerOK = (not useOwnership) or _CooldownOwner_IsOwned(spellName)
-
-			if ownerOK and rem and rem > 0 then
-				if not _RemainingPasses(rem, c.remainingComp, threshold) then
-					show = false
-				end
-			end
+            -- the real remaining cooldown for this spellbook entry.
+            if rem and rem > 0 then
+                if not _RemainingPasses(rem, c.remainingComp, threshold) then
+                    show = false
+                end
+            end
         end
     end
 
     -- === Aura Conditions (extra ability gating) ===========================
-    -- If any auraConditions are configured, ALL of them must pass.
     if show and c.auraConditions and table.getn(c.auraConditions) > 0 then
         if not _EvaluateAuraConditionsList(c.auraConditions) then
             show = false
@@ -2337,7 +2537,7 @@ local function CheckItemConditions(data)
     if show and (allowHelp or allowHarm or allowSelf) then
         local ok = false
 
-        -- Self: must explicitly be targeting yourself
+        -- Self: must explicitly be targeting player
         if allowSelf and UnitExists("target") and UnitIsUnit("player", "target") then
             ok = true
         end
@@ -2561,16 +2761,28 @@ local function CheckAuraConditions(data)
             local i, hit = 1, false
             if wantBuff then
                 while i <= 40 do
-                    local n = _GetAuraName("player", i, false); if not n then break end
-                    if n == name then hit = true; break end
+                    local n = _GetAuraName("player", i, false)
+                    if n == nil then
+                        break  -- real end of list
+                    end
+                    if n ~= "" and n == name then
+                        hit = true
+                        break
+                    end
                     i = i + 1
                 end
             end
             if (not hit) and wantDebuff then
                 i = 1
                 while i <= 40 do
-                    local n = _GetAuraName("player", i, true); if not n then break end
-                    if n == name then hit = true; break end
+                    local n = _GetAuraName("player", i, true)
+                    if n == nil then
+                        break
+                    end
+                    if n ~= "" and n == name then
+                        hit = true
+                        break
+                    end
                     i = i + 1
                 end
             end
@@ -2848,6 +3060,7 @@ end
 -- Main update
 ---------------------------------------------------------------
 function DoiteConditions:EvaluateAll()
+	local editingAny = _IsAnyKeyUnderEdit()
     local live = DoiteAurasDB and DoiteAurasDB.spells
     local edit = DoiteDB and DoiteDB.icons
     if not live and not edit then return end
@@ -2909,6 +3122,271 @@ function DoiteConditions:EvaluateAll()
     end
 end
 
+-- Centralized overlay updater: remaining-time text + stacks.
+-- Used by both ApplyVisuals (logic passes) and the light timer ticker.
+local function _Doite_UpdateOverlayForFrame(frame, key, dataTbl, slideActive)
+    if not frame or not dataTbl then return end
+
+    -- Ensure a dedicated top layer so text always renders above any glow frames
+    if not frame._daTextLayer then
+        local tl = CreateFrame("Frame", nil, frame)
+        frame._daTextLayer = tl
+        tl:SetAllPoints(frame)
+    end
+
+    -- Keep this child well above siblings (incl. typical glow frames)
+    do
+        local baseLevel = frame:GetFrameLevel() or 0
+        frame._daTextLayer:SetFrameStrata(frame:GetFrameStrata() or "MEDIUM")
+        frame._daTextLayer:SetFrameLevel(baseLevel + 50)
+    end
+
+    -- Lazy-create fontstrings parented to the text layer
+    if not frame._daTextRem then
+        local fs = frame._daTextLayer:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+        fs:SetJustifyH("CENTER")
+        fs:SetJustifyV("MIDDLE")
+        frame._daTextRem = fs
+    end
+    if not frame._daTextStacks then
+        local fs2 = frame._daTextLayer:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        fs2:SetJustifyH("RIGHT")
+        fs2:SetJustifyV("BOTTOM")
+        frame._daTextStacks = fs2
+        frame._daLastTextSize = 0
+    end
+
+    -- Only resize if changed
+    local w = frame:GetWidth() or 36
+    local last = frame._daLastTextSize or 0
+    if math.abs(w - last) >= 1 then
+        frame._daLastTextSize = w
+        local remSize   = math.max(10, math.floor(w * 0.42))
+        local stackSize = math.max(8,  math.floor(w * 0.28))
+        frame._daTextRem:SetFont(GameFontHighlight:GetFont(), remSize, "OUTLINE")
+        frame._daTextStacks:SetFont(GameFontNormalSmall:GetFont(), stackSize, "OUTLINE")
+    end
+
+    -- Anchor (relative to the icon frame; parented to _daTextLayer)
+    frame._daTextRem:ClearAllPoints()
+    frame._daTextRem:SetPoint("CENTER", frame, "CENTER", 0, 0)
+
+    frame._daTextStacks:ClearAllPoints()
+    frame._daTextStacks:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -2, 2)
+
+    -- Defaults hidden
+    frame._daTextRem:SetText("")
+    frame._daTextRem:Hide()
+    frame._daTextStacks:SetText("")
+    frame._daTextStacks:Hide()
+
+    -- Reset per-evaluation sort remaining time (used by group "time" mode)
+    frame._daSortRem = nil
+
+    -- ========== Remaining Time ==========
+    local wantRem = false
+    local remText = nil
+
+    -- Decide if show time text for abilities
+    local function _ShowAbilityTime(ca, rem, dur, slide)
+        if not rem or rem <= 0 then return false end
+        dur = dur or 0
+
+        -- 1) ON COOLDOWN: always show for the entire real cooldown.
+        if ca.mode == "oncd" then
+            return (dur > 0)
+        end
+
+        -- 2) USABLE / NOTCD with slider: slide can override the 1.6s/GCD filter
+        if (ca.mode == "usable" or ca.mode == "notcd") and ca.slider == true then
+            if slide then
+                return true
+            end
+            local maxWindow = math.min(3.0, (dur or 0) * 0.6)
+            return rem <= maxWindow and (dur > 1.6)
+        end
+
+        -- Default (paranoid): late window + real cooldown
+        local maxWindow = math.min(3.0, (dur or 0) * 0.6)
+        return (dur > 1.6) and (rem <= maxWindow)
+    end
+
+    if dataTbl then
+        ----------------------------------------------------------------
+        -- Ability remaining-time text
+        ----------------------------------------------------------------
+        if dataTbl.type == "Ability"
+           and dataTbl.conditions
+           and dataTbl.conditions.ability then
+
+            local ca = dataTbl.conditions.ability
+            if ca.textTimeRemaining == true then
+                local spellName  = _GetCanonicalSpellNameFromData(dataTbl)
+                local remCD, durCD  = _AbilityCooldownByName(spellName)
+                local isWarriorProc = _isWarrior
+                                      and (spellName == "Overpower" or spellName == "Revenge")
+                local remShown, durShown
+
+                -- 1) Normal CD text (on cooldown)
+                if remCD and remCD > 0 and _ShowAbilityTime(ca, remCD, durCD, slideActive) then
+                    remShown = remCD
+                    durShown = durCD
+                -- 2) Warrior proc window text when NOT on cooldown
+                elseif isWarriorProc and (not remCD or remCD <= 0) then
+                    local remProc = _WarriorProcRemainingForSpell(spellName)
+                    if remProc and remProc > 0 then
+                        remShown = remProc
+                        durShown = 4.0
+                    end
+                end
+
+                if remShown and remShown > 0 then
+                    remText = _FmtRem(remShown)
+                    wantRem = (remText ~= nil)
+                end
+
+                -- For group "time" sorting: use whatevershowing
+                if remShown and remShown > 0 then
+                    local usesTimeForLogic =
+                        (ca.mode == "oncd") or (ca.remainingEnabled == true)
+                    if usesTimeForLogic then
+                        frame._daSortRem = remShown
+                    end
+                end
+            end
+
+        ----------------------------------------------------------------
+        -- Item remaining-time text (trinkets, usable items)
+        ----------------------------------------------------------------
+        elseif dataTbl.type == "Item"
+           and dataTbl.conditions
+           and dataTbl.conditions.item then
+
+            local ci = dataTbl.conditions.item
+            if ci.textTimeRemaining == true then
+                -- Reuse the same core state CheckItemConditions uses
+                local state = _EvaluateItemCoreState(dataTbl, ci)
+                if state and state.rem and state.rem > 0 then
+                    remText = _FmtRem(state.rem)
+                    wantRem = (remText ~= nil)
+
+                    -- Let group “time” sort by this remaining
+                    frame._daSortRem = state.rem
+                end
+            end
+			
+        ----------------------------------------------------------------
+        -- Aura remaining-time text (player via cached timers, target via Cursive)
+        ----------------------------------------------------------------
+        elseif (dataTbl.type == "Buff" or dataTbl.type == "Debuff")
+           and dataTbl.conditions
+           and dataTbl.conditions.aura then
+
+            local ca = dataTbl.conditions.aura
+            if ca.textTimeRemaining == true then
+                local auraName = dataTbl.displayName or dataTbl.name
+                local rem      = nil
+
+                -- Decide unit: mostly mirrors CheckAuraConditions target logic
+                local unitForRem = nil
+                if ca.targetSelf == true then
+                    unitForRem = "player"
+                else
+                    local hasHelp = (ca.targetHelp == true)
+                    local hasHarm = (ca.targetHarm == true)
+
+                    if UnitExists("target") and (hasHelp or hasHarm) then
+                        if hasHelp and hasHarm then
+                            if not UnitIsUnit("player","target") then
+                                unitForRem = "target"
+                            end
+                        elseif hasHelp then
+                            if UnitIsFriend("player","target")
+                               and (not UnitIsUnit("player","target")) then
+                                unitForRem = "target"
+                            end
+                        elseif hasHarm then
+                            if UnitCanAttack("player","target")
+                               and (not UnitIsFriend("player","target")) then
+                                unitForRem = "target"
+                            end
+                        end
+                    end
+                end
+
+                if unitForRem == "player" then
+                    rem = _PlayerAuraRemainingSeconds(auraName)
+                elseif unitForRem == "target" then
+                    -- Only player own debuffs will have timings via Cursive.
+                    rem = _CursiveAuraRemainingSeconds(auraName, "target")
+                end
+
+                if rem and rem > 0 then
+                    remText = _FmtRem(rem)
+                    wantRem = (remText ~= nil)
+
+                    -- For group "time" sorting: timed buff/debuff
+                    frame._daSortRem = rem
+                end
+            end
+        end
+    end
+
+    if wantRem and remText then
+        frame._daTextRem:SetText(remText)
+        frame._daTextRem:SetTextColor(1, 1, 1, 1) -- white
+        frame._daTextRem:Show()
+    end
+
+    -- ========== Stack Counter (auras only) ==========
+    if dataTbl
+       and (dataTbl.type == "Buff" or dataTbl.type == "Debuff")
+       and dataTbl.conditions
+       and dataTbl.conditions.aura then
+
+        local ca = dataTbl.conditions.aura
+        if ca.textStackCounter == true then
+            local auraName   = dataTbl.displayName or dataTbl.name
+            local wantDebuff = (dataTbl.type == "Debuff")
+
+            -- Resolve which unit to read stacks from (same semantics as CheckAuraConditions)
+            local unitToCheck = nil
+            local allowHelp   = (ca.targetHelp == true)
+            local allowHarm   = (ca.targetHarm == true)
+            local allowSelf   = (ca.targetSelf == true)
+
+            -- If nothing selected, default to Self
+            if (not allowHelp) and (not allowHarm) and (not allowSelf) then
+                allowSelf = true
+            end
+
+            if allowSelf then
+                unitToCheck = "player"
+            elseif UnitExists("target") and (allowHelp or allowHarm) then
+                local isFriend  = UnitIsFriend("player","target")
+                local canAttack = UnitCanAttack("player","target")
+
+                -- Help: friendly targets including self
+                if allowHelp and isFriend then
+                    unitToCheck = "target"
+                -- Harm: hostile, non-friendly targets
+                elseif allowHarm and canAttack and (not isFriend) then
+                    unitToCheck = "target"
+                end
+            end
+
+            if unitToCheck then
+                local cnt = _GetAuraStacksOnUnit(unitToCheck, auraName, wantDebuff)
+                if cnt and cnt >= 1 then
+                    frame._daTextStacks:SetText(tostring(cnt))
+                    frame._daTextStacks:SetTextColor(1, 0.2, 0.2, 1) -- red
+                    frame._daTextStacks:Show()
+                end
+            end
+        end
+    end
+end
+
 ---------------------------------------------------------------
 -- Apply visuals to icons
 ---------------------------------------------------------------
@@ -2955,22 +3433,30 @@ function DoiteConditions:ApplyVisuals(key, show, glow, grey)
         local startedSlide = false
         local stoppedSlide = false
 
-            if ca.slider and (ca.mode == "usable" or ca.mode == "notcd") then
-            local spellName = dataTbl.displayName or dataTbl.name
-			local rem, dur  = _AbilityCooldownByName(spellName)
-			local wasSliding = SlideMgr.active and SlideMgr.active[key]
-			local maxWindow  = math.min(3.0, (dur or 0) * 0.6)
+        -- Slider only ever makes sense for usable/notcd modes
+        if ca.slider and (ca.mode == "usable" or ca.mode == "notcd") then
+            local spellName  = _GetCanonicalSpellNameFromData(dataTbl)
+            local rem, dur   = _AbilityCooldownByName(spellName)
+            local wasSliding = SlideMgr.active and SlideMgr.active[key]
+            local maxWindow  = math.min(3.0, (dur or 0) * 0.6)
 
-			-- Only shared-CD spells care about “ownership”.
-			local ownerOK
-			if _IsSharedCooldownSpell(spellName) then
-				ownerOK = _CooldownOwner_IsOwned(spellName)
-			else
-				ownerOK = (rem and rem > 0)
-			end
+            -- Last time *this* spell was actually cast (UNIT_CASTEVENT -> _MarkSliderSeen)
+            local lastSeen = spellName and _SliderSeen and _SliderSeen[spellName] or nil
 
-			local shouldStart    = ownerOK and rem and dur and dur > 1.6 and rem > 0 and rem <= maxWindow
-			local shouldContinue = ownerOK and wasSliding and rem and rem > 0
+
+            local hasSeenForThisCD = false
+            if lastSeen and rem and dur and dur > 0 then
+                local now   = GetTime()
+                -- reconstruct approximate cooldown start from (now, rem, dur)
+                local start = now + rem - dur
+                -- small epsilon because lastSeen and start are sampled in
+                if lastSeen + 0.25 >= start then
+                    hasSeenForThisCD = true
+                end
+            end
+
+            local shouldStart    = hasSeenForThisCD and rem and dur and dur > 1.6 and rem > 0 and rem <= maxWindow
+            local shouldContinue = hasSeenForThisCD and wasSliding and rem and rem > 0
 
             if shouldStart or shouldContinue then
                 local baseX, baseY = 0, 0
@@ -2978,7 +3464,9 @@ function DoiteConditions:ApplyVisuals(key, show, glow, grey)
                 SlideMgr:StartOrUpdate(key, (ca.sliderDir or "center"), baseX, baseY, GetTime() + rem)
                 startedSlide = (not wasSliding) and true or false
             else
-                if wasSliding then stoppedSlide = true end
+                if wasSliding then
+                    stoppedSlide = true
+                end
                 SlideMgr:Stop(key)
             end
         else
@@ -3114,248 +3602,7 @@ function DoiteConditions:ApplyVisuals(key, show, glow, grey)
 			end
 		end
         -- === Overlay Text: cooldown remaining + stacks (forced above glow) ===
-        do
-            -- Ensure a dedicated top layer so text always renders above any glow frames
-            if not frame._daTextLayer then
-                local tl = CreateFrame("Frame", nil, frame)
-                frame._daTextLayer = tl
-                tl:SetAllPoints(frame)
-            end
-            -- Keep this child well above siblings (incl. typical glow frames)
-            do
-                local baseLevel = frame:GetFrameLevel() or 0
-                frame._daTextLayer:SetFrameStrata(frame:GetFrameStrata() or "MEDIUM")
-                frame._daTextLayer:SetFrameLevel(baseLevel + 50)
-            end
-
-            -- Lazy-create fontstrings parented to the text layer
-            if not frame._daTextRem then
-                local fs = frame._daTextLayer:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-                fs:SetJustifyH("CENTER")
-                fs:SetJustifyV("MIDDLE")
-                frame._daTextRem = fs
-            end
-            if not frame._daTextStacks then
-                local fs2 = frame._daTextLayer:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-                fs2:SetJustifyH("RIGHT")
-                fs2:SetJustifyV("BOTTOM")
-                frame._daTextStacks = fs2
-                frame._daLastTextSize = 0
-            end
-
-            -- Only resize if changed
-            local w = frame:GetWidth() or 36
-            local last = frame._daLastTextSize or 0
-            if math.abs(w - last) >= 1 then
-                frame._daLastTextSize = w
-                local remSize   = math.max(10, math.floor(w * 0.42))
-                local stackSize = math.max(8,  math.floor(w * 0.28))
-                frame._daTextRem:SetFont(GameFontHighlight:GetFont(), remSize, "OUTLINE")
-                frame._daTextStacks:SetFont(GameFontNormalSmall:GetFont(), stackSize, "OUTLINE")
-            end
-
-            -- Anchor (relative to the icon frame; parented to _daTextLayer)
-            frame._daTextRem:ClearAllPoints()
-            frame._daTextRem:SetPoint("CENTER", frame, "CENTER", 0, 0)
-
-            frame._daTextStacks:ClearAllPoints()
-            frame._daTextStacks:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -2, 2)
-
-            -- Defaults hidden
-            frame._daTextRem:SetText("")
-            frame._daTextRem:Hide()
-            frame._daTextStacks:SetText("")
-            frame._daTextStacks:Hide()
-
-            -- Reset per-evaluation sort remaining time (used by group \"time\" mode)
-            frame._daSortRem = nil
-
-            -- ========== Remaining Time ==========
-            local wantRem = false
-            local remText = nil
-
-            -- Decide if shown show time text for abilities
-            local function _ShowAbilityTime(ca, rem, dur, slideActive)
-                if not rem or rem <= 0 then return false end
-                dur = dur or 0
-
-                -- 1) ON COOLDOWN: always show for the entire real cooldown.
-                if ca.mode == "oncd" then
-                    return (dur > 0)
-                end
-
-                -- 2) USABLE / NOTCD with slider: slide can override the 1.6s/GCD filter
-                if (ca.mode == "usable" or ca.mode == "notcd") and ca.slider == true then
-                    if slideActive then
-                        return true
-                    end
-                    local maxWindow = math.min(3.0, (dur or 0) * 0.6)
-                    return rem <= maxWindow and (dur > 1.6)
-                end
-
-                -- Default (paranoid): late window + real cooldown
-                local maxWindow = math.min(3.0, (dur or 0) * 0.6)
-                return (dur > 1.6) and (rem <= maxWindow)
-            end
-
-            if dataTbl then
-                ----------------------------------------------------------------
-                -- Ability remaining-time text
-                ----------------------------------------------------------------
-                if dataTbl.type == "Ability"
-                   and dataTbl.conditions
-                   and dataTbl.conditions.ability then
-
-                    local ca = dataTbl.conditions.ability
-                    if ca.textTimeRemaining == true then
-                        local spellName = dataTbl.displayName or dataTbl.name
-                        local rem, dur  = _AbilityCooldownByName(spellName)
-
-                        -- For text, we don't require ownership: show whenever this spell truly has a cooldown.
-                        if rem and rem > 0 and _ShowAbilityTime(ca, rem, dur, slideActive) then
-                            remText = _FmtRem(rem)
-                            wantRem = (remText ~= nil)
-                        end
-
-                        -- For group \"time\" sorting: any positive cooldown here counts as \"timed\"
-                        if rem and rem > 0 then
-                            local usesTimeForLogic =
-                                (ca.mode == "oncd") or (ca.remainingEnabled == true)
-                            if usesTimeForLogic then
-                                frame._daSortRem = rem
-                            end
-                        end
-                    end
-
-                ----------------------------------------------------------------
-                -- Item remaining-time text (uses the same core state as conditions)
-                ----------------------------------------------------------------
-                elseif dataTbl.type == "Item"
-                   and dataTbl.conditions
-                   and dataTbl.conditions.item then
-
-                    local ci    = dataTbl.conditions.item
-                    if ci.textTimeRemaining == true then
-                        local st = _EvaluateItemCoreState(dataTbl, ci)
-                        if st.rem and st.rem > 0 then
-                            remText = _FmtRem(st.rem)
-                            wantRem = (remText ~= nil)
-
-                            -- For group \"time\" sorting: item cooldown
-                            frame._daSortRem = st.rem
-                        end
-                    end
-
-                ----------------------------------------------------------------
-                -- Aura remaining-time text (player via GetPlayerBuff, target via Cursive)
-                ----------------------------------------------------------------
-                elseif (dataTbl.type == "Buff" or dataTbl.type == "Debuff")
-                   and dataTbl.conditions
-                   and dataTbl.conditions.aura then
-
-                    local ca = dataTbl.conditions.aura
-                    if ca.textTimeRemaining == true then
-                        local auraName = dataTbl.displayName or dataTbl.name
-                        local rem      = nil
-
-                        -- Decide unit: mostly mirrors CheckAuraConditions target logic
-                        local unitForRem = nil
-                        if ca.targetSelf == true then
-                            unitForRem = "player"
-                        else
-                            local hasHelp = (ca.targetHelp == true)
-                            local hasHarm = (ca.targetHarm == true)
-
-                            if UnitExists("target") and (hasHelp or hasHarm) then
-                                if hasHelp and hasHarm then
-                                    if not UnitIsUnit("player","target") then
-                                        unitForRem = "target"
-                                    end
-                                elseif hasHelp then
-                                    if UnitIsFriend("player","target")
-                                       and (not UnitIsUnit("player","target")) then
-                                        unitForRem = "target"
-                                    end
-                                elseif hasHarm then
-                                    if UnitCanAttack("player","target")
-                                       and (not UnitIsFriend("player","target")) then
-                                        unitForRem = "target"
-                                    end
-                                end
-                            end
-                        end
-
-                        if unitForRem == "player" then
-                            rem = _PlayerAuraRemainingSeconds(auraName)
-                        elseif unitForRem == "target" then
-                            -- Only your own debuffs will have timings via Cursive.
-                            rem = _CursiveAuraRemainingSeconds(auraName, "target")
-                        end
-
-                        if rem and rem > 0 then
-                            remText = _FmtRem(rem)
-                            wantRem = (remText ~= nil)
-
-                            -- For group \"time\" sorting: timed buff/debuff
-                            frame._daSortRem = rem
-                        end
-                    end
-                end
-			end
-            if wantRem and remText then
-                frame._daTextRem:SetText(remText)
-                frame._daTextRem:SetTextColor(1, 1, 1, 1) -- white
-                frame._daTextRem:Show()
-            end
-
-            -- ========== Stack Counter (auras only) ==========
-            if dataTbl
-               and (dataTbl.type == "Buff" or dataTbl.type == "Debuff")
-               and dataTbl.conditions
-               and dataTbl.conditions.aura then
-
-                local ca = dataTbl.conditions.aura
-                if ca.textStackCounter == true then
-                    local auraName   = dataTbl.displayName or dataTbl.name
-                    local wantDebuff = (dataTbl.type == "Debuff")
-
-                    -- Resolve which unit to read stacks from (same semantics as CheckAuraConditions)
-                    local unitToCheck = nil
-                    local allowHelp   = (ca.targetHelp == true)
-                    local allowHarm   = (ca.targetHarm == true)
-                    local allowSelf   = (ca.targetSelf == true)
-
-                    -- If nothing selected, default to Self
-                    if (not allowHelp) and (not allowHarm) and (not allowSelf) then
-                        allowSelf = true
-                    end
-
-                    if allowSelf then
-                        unitToCheck = "player"
-                    elseif UnitExists("target") and (allowHelp or allowHarm) then
-                        local isFriend  = UnitIsFriend("player","target")
-                        local canAttack = UnitCanAttack("player","target")
-
-                        -- Help: friendly targets including self
-                        if allowHelp and isFriend then
-                            unitToCheck = "target"
-                        -- Harm: hostile, non-friendly targets
-                        elseif allowHarm and canAttack and (not isFriend) then
-                            unitToCheck = "target"
-                        end
-                    end
-
-                    if unitToCheck then
-                        local cnt = _GetAuraStacksOnUnit(unitToCheck, auraName, wantDebuff)
-                        if cnt and cnt >= 1 then
-                            frame._daTextStacks:SetText(tostring(cnt))
-                            frame._daTextStacks:SetTextColor(1, 0.2, 0.2, 1) -- red
-                            frame._daTextStacks:Show()
-                        end
-                    end
-                end
-            end
-        end
+        _Doite_UpdateOverlayForFrame(frame, key, dataTbl, slideActive)
     end
 
 	-- === Apply EFFECTS with change detection (don’t restart animations every frame) ===
@@ -3425,9 +3672,12 @@ function DoiteConditions:ApplyVisuals(key, show, glow, grey)
 end
 
 function DoiteConditions_RequestEvaluate()
-    -- Re-scan icons so we know if anyone still needs the time heartbeat
+    -- Re-scan icons if anyone still needs the time heartbeat
     if _RebuildAbilityTimeHeartbeatFlag then
         _RebuildAbilityTimeHeartbeatFlag()
+    end
+    if _RebuildAuraTimeHeartbeatFlag then
+        _RebuildAuraTimeHeartbeatFlag()
     end
     if _RebuildAuraUsageFlags then
         _RebuildAuraUsageFlags()
@@ -3436,6 +3686,7 @@ function DoiteConditions_RequestEvaluate()
 end
 
 function DoiteConditions:EvaluateAbilities(doLogic, doTime)
+    local editingAny = _IsAnyKeyUnderEdit()
     -- Default behaviour (no args): full logic + time, as before.
     if doLogic == nil and doTime == nil then
         doLogic, doTime = true, true
@@ -3513,6 +3764,7 @@ function DoiteConditions:EvaluateAbilities(doLogic, doTime)
 end
 
 function DoiteConditions:EvaluateAuras()
+    local editingAny = _IsAnyKeyUnderEdit()
     local live = DoiteAurasDB and DoiteAurasDB.spells
     local edit = DoiteDB and DoiteDB.icons
     if not live and not edit then return end
@@ -3532,7 +3784,7 @@ function DoiteConditions:EvaluateAuras()
     end
 
 	-- 2) Any extra editor-only icons (keys not in live)
-    if edit then
+    if edit and editingAny then
         for key, data in pairs(edit) do
             if (not live) or (not live[key]) then
                 if type(data) ~= "table" then
@@ -3566,43 +3818,81 @@ end
 
 _G.DoiteConditions_WarriorProcTick = _WarriorProcTick
 
+-- Lightweight pass that ONLY refreshes remaining-time text / stacks.
+-- No condition logic, no aura scanning – uses existing cached data.
+local function DoiteConditions_UpdateTimeText()
+    local live = DoiteAurasDB and DoiteAurasDB.spells
+    local edit = DoiteDB and DoiteDB.icons
+    if not live and not edit then return end
+
+	local function hasTimeLogicForData(data)
+		if not data or not data.type then return false end
+		if data.type == "Ability" then
+			return _IconHasTimeLogic_Ability(data)
+		elseif data.type == "Buff" or data.type == "Debuff" then
+			return _IconHasTimeLogic_Aura(data)
+		elseif data.type == "Item" then
+			return _IconHasTimeLogic_Item(data)
+		end
+		return false
+	end
+
+    local function processSet(set, skipKeys)
+        if not set then return end
+        for key, data in pairs(set) do
+            if type(data) == "table" and data.type then
+                if not skipKeys or not skipKeys[key] then
+                    -- Skip icons that never use time text / remaining logic.
+                    if hasTimeLogicForData(data) then
+                        local frame = _G["DoiteIcon_" .. key]
+                        if frame and frame:IsShown() then
+                            local dataTbl =
+                                (DoiteDB and DoiteDB.icons and DoiteDB.icons[key])
+                                or (DoiteAurasDB and DoiteAurasDB.spells and DoiteAurasDB.spells[key])
+                            if dataTbl then
+                                _Doite_UpdateOverlayForFrame(
+                                    frame,
+                                    key,
+                                    dataTbl,
+                                    frame._daSliding == true
+                                )
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- Runtime icons
+    processSet(live, nil)
+
+    -- Editor-only icons (keys not in live)
+    if edit then
+        processSet(edit, live or {})
+    end
+end
+
 local _tick = CreateFrame("Frame")
 
 -- Keep these as globals so the OnUpdate script doesn't capture them as upvalues
 _acc        = 0
-_scanAccum  = 0
 _textAccum  = 0
 
 -- Lift the body into a real function
 local function DoiteConditions_OnUpdate(dt)
     _acc       = _acc + dt
-    _scanAccum = _scanAccum + dt
     _textAccum = _textAccum + dt
-
-    local AURA_SCAN_INTERVAL = 0.30
-    -- Refresh player & target auras every 0.3s
-    if _scanAccum >= AURA_SCAN_INTERVAL then
-        _scanAccum = 0
-
-        -- Always keep player snapshot fresh
-        DoiteConditions_ScanUnitAuras("player")
-        dirty_aura = true
-
-        -- Only burn tooltip scans on target if *any* icon/config ever cares.
-        if _hasAnyTargetAuraUsage and _G.UnitExists and _G.UnitExists("target") then
-            DoiteConditions_ScanUnitAuras("target")
-            dirty_aura = true
-        end
-    end
 
     -- Keep warrior Overpower/Revenge procs in sync even if no other events fire
     DoiteConditions_WarriorProcTick()
 
-    -- Smooth remaining-time updates (abilities) every 0.5s.
-    if _textAccum >= 0.5 then
+    -- Smooth remaining-time text (abilities/items/auras) on a cheap path
+    if _textAccum >= 0.1 then
         _textAccum = 0
-        if _hasAnyAbilityTimeLogic then
-            dirty_ability_time = true   -- lightweight pass for CD text / remainingEnabled
+
+        if _hasAnyAbilityTimeLogic or _hasAnyAuraTimeLogic then
+            DoiteConditions_UpdateTimeText()
         end
     end
 
@@ -3665,7 +3955,6 @@ eventFrame:RegisterEvent("SPELLS_CHANGED")
 eventFrame:RegisterEvent("UNIT_HEALTH")
 eventFrame:RegisterEvent("PLAYER_COMBO_POINTS")
 eventFrame:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
-eventFrame:RegisterEvent("UNIT_INVENTORY_CHANGED")
 
 eventFrame:SetScript("OnEvent", function()
     if event == "PLAYER_ENTERING_WORLD" then
@@ -3681,22 +3970,88 @@ eventFrame:SetScript("OnEvent", function()
         cls = cls and string.upper(cls) or ""
         _isWarrior = (cls == "WARRIOR")
 
-        -- Prime the time-heartbeat flag
+        -- Prime time-heartbeat flags
         if _RebuildAbilityTimeHeartbeatFlag then
             _RebuildAbilityTimeHeartbeatFlag()
         end
-
-        -- Adjust combat-log listeners based on class
-        if _UpdateCombatLogRegistration then
-            _UpdateCombatLogRegistration()
+        if _RebuildAuraTimeHeartbeatFlag then
+            _RebuildAuraTimeHeartbeatFlag()
         end
 
 	elseif event == "UNIT_AURA" then
-		if arg1 == "player" or arg1 == "target" then
+		if arg1 == "player" then
+			-- Player auras changed: rebuild snapshot once
+			DoiteConditions_ScanUnitAuras("player")
+
+			-- Only rebuild per-name timer cache if any aura icon actually uses time logic.
+			if _hasAnyAuraTimeLogic then
+				local timers = PlayerAuraTimers
+				if timers then
+					for k in pairs(timers.buffs)   do timers.buffs[k]   = nil end
+					for k in pairs(timers.debuffs) do timers.debuffs[k] = nil end
+
+					if GetPlayerBuff and GetPlayerBuffTimeLeft
+					   and DoiteConditionsTooltip
+					   and DoiteConditionsTooltip.SetPlayerBuff then
+
+						-- HELPFUL (buffs)
+						for i = 0, 31 do
+							local idx = GetPlayerBuff(i, "HELPFUL")
+							if not idx or idx < 0 then break end
+
+							DoiteConditionsTooltip:ClearLines()
+							DoiteConditionsTooltip:SetPlayerBuff(idx)
+							local tn = DoiteConditionsTooltipTextLeft1
+									   and DoiteConditionsTooltipTextLeft1:GetText()
+							if tn and tn ~= "" then
+								local tl = GetPlayerBuffTimeLeft(idx)
+								if tl and tl > 0 then
+									timers.buffs[tn] = GetTime() + tl
+								end
+							end
+						end
+
+						-- HARMFUL (debuffs)
+						for i = 0, 31 do
+							local idx = GetPlayerBuff(i, "HARMFUL")
+							if not idx or idx < 0 then break end
+
+							DoiteConditionsTooltip:ClearLines()
+							DoiteConditionsTooltip:SetPlayerBuff(idx)
+							local tn = DoiteConditionsTooltipTextLeft1
+									   and DoiteConditionsTooltipTextLeft1:GetText()
+							if tn and tn ~= "" then
+								local tl = GetPlayerBuffTimeLeft(idx)
+								if tl and tl > 0 then
+									timers.debuffs[tn] = GetTime() + tl
+								end
+							end
+						end
+					end
+				end
+			end
+
 			dirty_aura    = true
 			dirty_ability = true
-		end
 
+    elseif arg1 == "target" then
+        -- Only bother if *any* config ever looks at target auras.
+        if _hasAnyTargetAuraUsage then
+            if _G.UnitExists and _G.UnitExists("target") then
+                DoiteConditions_ScanUnitAuras("target")
+            else
+                local snap = _G.DoiteConditions_AuraSnapshot
+                local s = snap and snap.target
+                if s then
+                    local b, d = s.buffs, s.debuffs
+                    if b then for k in pairs(b) do b[k] = nil end end
+                    if d then for k in pairs(d) do d[k] = nil end end
+                end
+            end
+            dirty_aura    = true
+            dirty_ability = true
+        end
+    end
 
     elseif event == "SPELLS_CHANGED" then
         local cache = _G.DoiteConditions_SpellIndexCache
@@ -3748,14 +4103,5 @@ eventFrame:SetScript("OnEvent", function()
         end
         dirty_ability = true
         dirty_aura    = true
-
-    elseif event == "UNIT_INVENTORY_CHANGED" then
-        if arg1 == "player" then
-            if _G.DoiteConditions_ClearTrinketFirstMemory then
-                _G.DoiteConditions_ClearTrinketFirstMemory()
-            end
-            dirty_ability = true
-            dirty_aura    = true
-        end
     end
 end)

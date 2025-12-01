@@ -635,6 +635,23 @@ local function _WhiteifyDDText(dd)
     end
 end
 
+-- Pretty-print helper: announce when entering edit for an icon
+local function DoiteEdit_AnnounceEditingIcon(displayName)
+    if not displayName or displayName == "" then
+        displayName = "Unknown"
+    end
+
+    local prefix = "|cff4da6ffDoiteAuras:|r "
+    local name   = "|cffffff00" .. tostring(displayName) .. "|r"
+
+    local msg = prefix ..
+        "During edit for " .. name ..
+        ", this icon will stay visible and be pinned at the top of its dynamic group (if any) for convenience."
+
+    DEFAULT_CHAT_FRAME:AddMessage(msg)
+end
+
+
 -- Local copy of the TitleCase helper used by DoiteAuras (for pretty printing aura names)
 local function AuraCond_TitleCase(str)
     if not str then return "" end
@@ -3893,6 +3910,17 @@ local function UpdateConditionsUI(data)
     if not condFrame then return end
     if not data then return end
     if not data.conditions then data.conditions = {} end
+
+    -- One-time chat announce per icon when its edit UI is first opened
+    if not data._editAnnounceShown then
+        data._editAnnounceShown = true
+        if data.displayName and data.displayName ~= "" then
+            DoiteEdit_AnnounceEditingIcon(data.displayName)
+        elseif currentKey then
+            DoiteEdit_AnnounceEditingIcon(currentKey)
+        end
+    end
+
     local c = data.conditions
 
     ----------------------------------------------------------------
