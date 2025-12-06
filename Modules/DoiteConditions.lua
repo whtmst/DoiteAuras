@@ -4529,16 +4529,19 @@ function DoiteConditions:ApplyVisuals(key, show, glow, grey)
 			showForSlide = false
 		end
 
-		-- Apply visibility only on change
-		if frame._daLastShown ~= showForSlide then
-			frame._daLastShown = showForSlide
-			if showForSlide then
-				frame:Show()
-				frame:SetAlpha(1)  -- avoid transient fade-outs during edit drags
-			else
-				frame:Hide()
-			end
-		end
+        -- Apply visibility only on change
+        if frame._daLastShown ~= showForSlide then
+            frame._daLastShown = showForSlide
+            if showForSlide then
+                frame:Show()
+
+                if not slideActive then
+                    frame:SetAlpha(1)
+                end
+            else
+                frame:Hide()
+            end
+        end
 
 		-- GREYSCALE — only flip when it changes
 		if frame.icon then
