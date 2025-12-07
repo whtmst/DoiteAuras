@@ -11,4 +11,4 @@ Looking for WeakAuras? DoiteAuras is an **ability**, **buff**, **debuff**, **ite
 _Please respect the license note._
 
 ## Tutorial
-[![Watch the video][(https://i.sstatic.net/Vp2cE.png)](https://streamable.com/t2g10i)
+[![Watch the video](https://img.youtube.com/vi/T-D1KVIuvjA/maxresdefault.jpg)](https://youtu.be/T-D1KVIuvjA)
