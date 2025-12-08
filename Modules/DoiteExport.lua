@@ -467,7 +467,7 @@ local function DE_SerializeValue(v, buf)
             first = false
 
             local kt = type(k)
-            if kt == "string" and string.match(k, "^[A-Za-z_][A-Za-z0-9_]*$") then
+            if kt == "string" and string.find(k, "^[A-Za-z_][A-Za-z0-9_]*$") then
                 table.insert(buf, k)
                 table.insert(buf, "=")
             else

@@ -34,7 +34,6 @@ local GetNumTalents    = GetNumTalents
 local GetTalentInfo    = GetTalentInfo
 
 local str_find  = string.find
-local str_match = string.match
 local str_gsub  = string.gsub
 
 -- Spell index cache (must be defined before any usage)
@@ -60,7 +59,7 @@ local function _GetSpellIndexByName(spellName)
         end
     end
 
-    -- Vanilla scan fallback
+    -- Scan fallback
     local i = 1
     while i <= 200 do
         local s = GetSpellName(i, BOOKTYPE_SPELL)
@@ -646,12 +645,22 @@ local function _ClearTrinketFirstMemory()
 end
 _G.DoiteConditions_ClearTrinketFirstMemory = _ClearTrinketFirstMemory
 
-
 -- Parse itemID and [Name] out of a WoW item link
 local function _ParseItemLink(link)
     if not link then return nil, nil end
-    local itemId = tonumber(str_match(link, "item:(%d+)"))
-    local name   = str_match(link, "%[(.+)%]")
+
+    local itemId
+    local _, _, idStr = str_find(link, "item:(%d+)")
+    if idStr then
+        itemId = tonumber(idStr)
+    end
+
+    local name
+    local _, _, nameStr = str_find(link, "%[(.+)%]")
+    if nameStr and nameStr ~= "" then
+        name = nameStr
+    end
+
     return itemId, name
 end
 
@@ -1061,6 +1070,21 @@ end
 _G["Doite_SliderSeen"] = _G["Doite_SliderSeen"] or {}
 local _SliderSeen = _G["Doite_SliderSeen"]
 
+local _SliderNoCastWhitelist = {
+    -- Druid
+    ["Hurricane"]   = true,
+    ["Tranquility"] = true,
+
+    -- Hunter
+    ["Volley"]      = true,
+
+    -- Shaman (totem-based AoE nukes)
+    ["Fire Nova Totem"] = true,
+
+    -- Warlock
+    ["Inferno"]      = true,
+}
+
 local function _MarkSliderSeen(spellName)
     if not spellName or spellName == "" then return end
     _SliderSeen[spellName] = GetTime() or 0
@@ -1143,17 +1167,25 @@ local function _CL_Parse(msg)
     -- Warrior-only reactive proc parsing (Overpower / Revenge)
     if _isWarrior then
         do
-            local tgt =
-                str_match(msg, "You attack%.%s+(.+)%s+dodges")
-                or str_match(msg, "Your%s+.+%s+was%s+dodged%s+by%s+(.+)")
+            local tgt
+            local _, _, t1 = str_find(msg, "You attack%.%s+(.+)%s+dodges")
+            if t1 then
+                tgt = t1
+            else
+                local _, _, t2 = str_find(msg, "Your%s+.+%s+was%s+dodged%s+by%s+(.+)")
+                tgt = t2
+            end
+
             if tgt then
+                tgt = str_gsub(tgt, "%s*[%.!%?]+%s*$", "")
+
                 _OP_target = tgt
                 _OP_until  = _Now() + 4.0
                 dirty_ability = true
             end
         end
 
-        -- Revenge proc: you dodge/parry/block or take a partially blocked hit
+        -- Revenge logic
         if str_find(msg, "You dodge")
            or str_find(msg, "You parry")
            or str_find(msg, "You block")
@@ -1377,19 +1409,45 @@ local function _GetBaseXY(key, dataTbl)
     return x, y
 end
 
--- Player-only aura remaining (seconds); nil if not timed / not found
+-- Player-only aura remaining (seconds); nil if not timed / not found.
 local function _PlayerAuraRemainingSeconds(auraName)
     if not auraName then return nil end
-    if not PlayerAuraTimers then return nil end
-
-    local now = GetTime()
-    local t = PlayerAuraTimers.buffs[auraName] or PlayerAuraTimers.debuffs[auraName]
-    if not t then
+    if not GetPlayerBuff or not GetPlayerBuffTimeLeft then
         return nil
     end
 
-    local rem = t - now
-    if rem > 0 then
+    _EnsureTooltip()
+
+    local function scan(kind)
+        local i = 0
+        while i <= 23 do
+            local idx = GetPlayerBuff(i, kind)
+            if not idx or idx < 0 then
+                break
+            end
+
+            DoiteConditionsTooltip:ClearLines()
+            DoiteConditionsTooltip:SetPlayerBuff(idx)
+
+            local fs   = _G["DoiteConditionsTooltipTextLeft1"]
+            local name = fs and fs:GetText()
+            if name and name == auraName then
+                local r = GetPlayerBuffTimeLeft(idx)
+                if r and r > 0 then
+                    return r
+                else
+                    -- Untimed or zero duration (no remaining time)
+                    return nil
+                end
+            end
+
+            i = i + 1
+        end
+        return nil
+    end
+
+    local rem = scan("HELPFUL") or scan("HARMFUL")
+    if rem and rem > 0 then
         return rem
     end
     return nil
@@ -2251,7 +2309,7 @@ local function _PassesTargetUnitType(condTbl, unit)
     end
 
     -- Single type "1. Humanoid"
-    local num, label = string.match(val, "^(%d+)%s*%.%s*(.+)$")
+    local _, _, num, label = str_find(val, "^(%d+)%s*%.%s*(.+)$")
     if num and label and label ~= "" then
         return (creatureType == label)
     end
@@ -2298,7 +2356,11 @@ local function _ClassifyEquippedSlot(slot)
     end
 
     -- Use the same itemID parsing you tested in /run
-    local itemId = tonumber(str_match(link, "item:(%d+)"))
+    local itemId
+    local _, _, idStr = str_find(link, "item:(%d+)")
+    if idStr then
+        itemId = tonumber(idStr)
+    end
     if not itemId then
         return { hasItem = true }
     end
@@ -4317,25 +4379,34 @@ local function _Doite_UpdateOverlayForFrame(frame, key, dataTbl, slideActive)
                 local auraName = dataTbl.displayName or dataTbl.name
                 local rem      = nil
 
-                -- Decide unit: mostly mirrors CheckAuraConditions target logic
+                -- Decide unit exactly like CheckAuraConditions:
+                --  - If no target flags set, default to self.
+                local allowHelp = (ca.targetHelp == true)
+                local allowHarm = (ca.targetHarm == true)
+                local allowSelf = (ca.targetSelf == true)
+
+                if (not allowHelp) and (not allowHarm) and (not allowSelf) then
+                    allowSelf = true
+                end
+
                 local unitForRem = nil
-                if ca.targetSelf == true then
+                if allowSelf then
                     unitForRem = "player"
                 else
-                    local hasHelp = (ca.targetHelp == true)
-                    local hasHarm = (ca.targetHarm == true)
-
-                    if UnitExists("target") and (hasHelp or hasHarm) then
-                        if hasHelp and hasHarm then
+                    if UnitExists("target") and (allowHelp or allowHarm) then
+                        if allowHelp and allowHarm then
+                            -- Both: any non-self target (friendly or hostile)
                             if not UnitIsUnit("player","target") then
                                 unitForRem = "target"
                             end
-                        elseif hasHelp then
+                        elseif allowHelp then
+                            -- Friendly target, excluding self
                             if UnitIsFriend("player","target")
                                and (not UnitIsUnit("player","target")) then
                                 unitForRem = "target"
                             end
-                        elseif hasHarm then
+                        elseif allowHarm then
+                            -- Hostile target
                             if UnitCanAttack("player","target")
                                and (not UnitIsFriend("player","target")) then
                                 unitForRem = "target"
@@ -4347,8 +4418,12 @@ local function _Doite_UpdateOverlayForFrame(frame, key, dataTbl, slideActive)
                 if unitForRem == "player" then
                     rem = _PlayerAuraRemainingSeconds(auraName)
                 elseif unitForRem == "target" then
-                    -- Only player own debuffs will have timings via Cursive.
-                    rem = _CursiveAuraRemainingSeconds(auraName, "target")
+                    -- Only use Cursive for target-harm debuffs owned by the player.
+                    if dataTbl.type == "Debuff" and ca.targetHarm == true then
+                        rem = _CursiveAuraRemainingSeconds(auraName, "target")
+                    else
+                        rem = nil
+                    end
                 end
 
                 if rem and rem > 0 then
@@ -4446,16 +4521,24 @@ local function _HandleAbilitySlider(key, ca, dataTbl)
     -- Last time *this* spell was actually seen cast (UNIT_CASTEVENT -> _MarkSliderSeen)
     local lastSeen = spellName and _SliderSeen and _SliderSeen[spellName] or nil
 
-    local hasSeenForThisCD = false
-    if lastSeen and rem and dur and dur > 0 then
-        local now   = GetTime()
-        -- reconstruct approximate cooldown start from (now, rem, dur)
-        local start = now + rem - dur
-        -- small epsilon because lastSeen and start are sampled in
-        if lastSeen + 0.25 >= start then
-            hasSeenForThisCD = true
-        end
-    end
+	local hasSeenForThisCD = false
+
+	if spellName
+	   and _SliderNoCastWhitelist[spellName]
+	   and rem and dur and dur > 1.6 then
+		-- Whitelisted: trust the *real* cooldown even without UNIT_CASTEVENT.
+		hasSeenForThisCD = true
+
+	elseif lastSeen and rem and dur and dur > 0 then
+		local now   = GetTime()
+		-- reconstruct approximate cooldown start from (now, rem, dur)
+		local start = now + rem - dur
+		-- small epsilon because lastSeen and start are sampled in
+		if lastSeen + 0.25 >= start then
+			hasSeenForThisCD = true
+		end
+	end
+
 
     -- Start only when this cooldown really belongs to this spell, but allow short CDs (GCD-only) as long as they're from this spell.
     local shouldStart    = hasSeenForThisCD and rem and dur and rem > 0 and rem <= maxWindow

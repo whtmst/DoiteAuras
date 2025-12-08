@@ -1123,7 +1123,7 @@ end
 
 local function DA_ParseGroupIndex(groupName)
     if not groupName or type(groupName) ~= "string" then return 9999 end
-    local num = string.match(groupName, "[Gg]roup%s*(%d+)")
+    local _, _, num = string.find(groupName, "[Gg]roup%s*(%d+)")
     if num then
         local n = tonumber(num)
         if n then return n end
@@ -2371,9 +2371,9 @@ addBtn:SetScript("OnClick", function()
   -- Detect pure numeric Buff/Debuff input as "spell ID mode"
   local spellIdStr = nil
   if (t == "Buff" or t == "Debuff") and not isSpecialHeader then
-      if string.match(name, "^(%d+)$") then
+      if string.find(name, "^(%d+)$") then
           spellIdStr = name
-          -- UI label while don't yet know the real spell name
+          -- UI label while not knowing know the real spell name
           name = "Spell ID: " .. spellIdStr .. " (will update when seen)"
       end
   end
@@ -2667,9 +2667,12 @@ end
 
 -- Version compare helpers
 local function DA_ParseVersion(v)
-  local a,b,c = string.match(tostring(v or ""), "^(%d+)%.(%d+)%.?(%d*)$")
+  local s = tostring(v or "")
+  local _, _, a, b, c = string.find(s, "^(%d+)%.(%d+)%.?(%d*)$")
+
   return tonumber(a) or 0, tonumber(b) or 0, tonumber(c) or 0
 end
+
 local function DA_IsNewer(v1, v2)
   local a1,b1,c1 = DA_ParseVersion(v1)
   local a2,b2,c2 = DA_ParseVersion(v2)
