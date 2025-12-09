@@ -1,10 +1,6 @@
 # DoiteAuras
 Looking for WeakAuras in Vanilla WoW? DoiteAuras is a lightweight, condition-based tracker for **abilities**, **buffs**, **debuffs**, **items** and **bars** in 1.12.
 
-Donations are not necessary, but if you enjoy my work change for coffee is always appreciated <3
-[<img width="50" height="50" alt="ChatGPT Image 9 dec  2025 11_11_10" src="https://github.com/user-attachments/assets/a0ed29c1-7855-4a61-a960-d5395d4c2edb" />](https://buymeacoffee.com/doite)
-
-
 ## OBS STILL UNDER BETA TESTING - JUST SLOWLY PREPARING FOR RELEASE - IF YOU ENCOUNTER ANY BUGS LET ME KNOW. PERFORMANCE OPTIMIZATION & BARS IS STILL TO BE DONE.
 
 > [!IMPORTANT]
