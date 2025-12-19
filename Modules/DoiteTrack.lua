@@ -286,9 +286,12 @@ local function _SpellUsesComboDuration(spellId)
     local uses = false
 
     if GetSpellRecField then
-        local ok, arr = pcall(GetSpellRecField, spellId, "effectPointsPerComboPoint")
+        local ok, arr = pcall(GetSpellRecField, spellId, "effectPointsPerComboPoint", 1)
+        if (not ok) or type(arr) ~= "table" then
+            ok, arr = pcall(GetSpellRecField, spellId, "effectPointsPerComboPoint")
+        end
+
         if ok and type(arr) == "table" then
-            -- Nampower returns arrays as normal Lua tables
             for i = 1, table.getn(arr) do
                 local v = arr[i]
                 if type(v) == "number" and v ~= 0 then
@@ -872,17 +875,33 @@ end
 local function _GetUnitAuraTable(unit, isDebuff)
     if not GetUnitField then return nil end
 
+    local function getFieldTable(fieldName)
+        -- Try copy=1 first (safe to store/iterate)
+        local ok, t = pcall(GetUnitField, unit, fieldName, 1)
+        if ok and type(t) == "table" then
+            return t
+        end
+
+        -- Fallback: older API builds may not accept the copy param
+        ok, t = pcall(GetUnitField, unit, fieldName)
+        if ok and type(t) == "table" then
+            return t
+        end
+
+        return nil
+    end
+
     -- Primary field used in this addon so far
-    local t = GetUnitField(unit, "aura")
-    if type(t) == "table" then return t end
+    local t = getFieldTable("aura")
+    if t then return t end
 
     -- Fallbacks (harmless if unsupported)
     if isDebuff then
-        t = GetUnitField(unit, "debuff")
-        if type(t) == "table" then return t end
+        t = getFieldTable("debuff")
+        if t then return t end
     else
-        t = GetUnitField(unit, "buff")
-        if type(t) == "table" then return t end
+        t = getFieldTable("buff")
+        if t then return t end
     end
 
     return nil
