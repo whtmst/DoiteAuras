@@ -97,6 +97,11 @@ local function DoiteAuras_RebuildSpellTextureCache()
             end
         end
     end
+
+    -- Spellbook indices can shift; force a fresh slot lookup next refresh
+    if DoiteAuras then
+        DoiteAuras._spellSlotCache = nil
+    end
 end
 
 -- Event hook: rebuild on login/world and whenever the spellbook changes (talent/build swaps)
@@ -104,6 +109,10 @@ local _daSpellTex = CreateFrame("Frame")
 _daSpellTex:RegisterEvent("PLAYER_ENTERING_WORLD")
 _daSpellTex:RegisterEvent("SPELLS_CHANGED")
 _daSpellTex:SetScript("OnEvent", function()
+    if DoiteAuras then
+        DoiteAuras._spellSlotCache = nil
+    end
+
     DoiteAuras_RebuildSpellTextureCache()
     if DoiteAuras_RefreshIcons then pcall(DoiteAuras_RefreshIcons) end
 end)
@@ -219,10 +228,19 @@ local function IterSiblings(name, typ)
   return iter, nil, nil
 end
 
-
 -- Tooltip for buff/debuff scanning
 local daTip = CreateFrame("GameTooltip", "DoiteAurasTooltip", nil, "GameTooltipTemplate")
 daTip:SetOwner(UIParent, "ANCHOR_NONE")
+
+-- Cache tooltip fontstrings once´
+local DA_TipLeft = {}
+do
+    local i = 1
+    while i <= 15 do
+        DA_TipLeft[i] = getglobal("DoiteAurasTooltipTextLeft" .. i)
+        i = i + 1
+    end
+end
 
 local function GetBuffName(unit, index, debuff)
     daTip:ClearLines()
@@ -615,7 +633,7 @@ end
 local function DA_TooltipHasUseOrConsume()
     local i
     for i = 1, 15 do
-        local fs = getglobal("DoiteAurasTooltipTextLeft"..i)
+        local fs = DA_TipLeft[i]
         if fs and fs.GetText then
             local txt = fs:GetText()
             if txt then
@@ -1088,6 +1106,17 @@ guide:SetText("Guide: DoiteAuras shows only what matters—abilities, buffs, deb
 -- storage
 local spellButtons, icons, groupHeaders = {}, {}, {}
 
+function DoiteAuras_GetIconFrame(key)
+    if not key then return nil end
+    local f = icons and icons[key]
+    if f then return f end
+
+    f = _G["DoiteIcon_" .. key]
+    if f and icons then
+        icons[key] = f
+    end
+    return f
+end
 
 local function GetIconLayout(key)
     if DoiteDB and DoiteDB.icons and DoiteDB.icons[key] then
@@ -1110,8 +1139,19 @@ local function GetOrderedSpells()
     for key, data in pairs(DoiteAurasDB.spells) do
         table.insert(list, { key = key, data = data, order = data.order or 999 })
     end
-    table.sort(list, function(a,b) return a.order < b.order end)
+    table.sort(list, function(a, b) return a.order < b.order end)
     return list
+end
+
+-- One shared comparator (avoids allocating a new closure in hot paths that sort by order).
+if DoiteAuras and not DoiteAuras._cmpSpellKeyByOrder then
+    DoiteAuras._cmpSpellKeyByOrder = function(a, b)
+        local da = DoiteAurasDB.spells[a]
+        local db = DoiteAurasDB.spells[b]
+        local oa = (da and da.order) or 999
+        local ob = (db and db.order) or 999
+        return oa < ob
+    end
 end
 
 -- small helpers for group-aware list building and movement
@@ -1656,18 +1696,68 @@ local function RefreshIcons()
         return
     end
     if not _CanRunRefresh() then return end
-    local ordered = GetOrderedSpells()
-    local total = table.getn(ordered)
-    local candidates = {}
+    -- Build a sorted key list by "order" without allocating {key,data,order} tables each refresh.
+    local keyList = DoiteAuras._orderedKeyList
+    if not keyList then
+        keyList = {}
+        DoiteAuras._orderedKeyList = keyList
+    end
+
+    local oldKeyN = table.getn(keyList)
+    local total = 0
+    for key in pairs(DoiteAurasDB.spells) do
+        total = total + 1
+        keyList[total] = key
+    end
+    for i = total + 1, oldKeyN do
+        keyList[i] = nil
+    end
+
+    if DoiteAuras._cmpSpellKeyByOrder then
+        table.sort(keyList, DoiteAuras._cmpSpellKeyByOrder)
+    else
+        -- Fallback (should not happen if Patch 1 applied)
+        table.sort(keyList, function(a, b)
+            local da = DoiteAurasDB.spells[a]
+            local db = DoiteAurasDB.spells[b]
+            local oa = (da and da.order) or 999
+            local ob = (db and db.order) or 999
+            return oa < ob
+        end)
+    end
+
+    -- Candidates + pool (internal only) to avoid per-refresh tables
+    local candidates = DoiteAuras._refreshCandidates
+    if not candidates then
+        candidates = {}
+        DoiteAuras._refreshCandidates = candidates
+    end
+    local pool = DoiteAuras._refreshCandidatePool
+    if not pool then
+        pool = {}
+        DoiteAuras._refreshCandidatePool = pool
+    end
+
+    local oldN = table.getn(candidates)
+    local n = 0
+
+    -- Cache table is stable; avoid re-calling DA_Cache() per entry
+    local cache = DA_Cache()
+
+    -- Cache spellbook slot per displayName (cleared on SPELLS_CHANGED via _daSpellTex)
+    local slotCache = DoiteAuras._spellSlotCache
+    if not slotCache then
+        slotCache = {}
+        DoiteAuras._spellSlotCache = slotCache
+    end
 
     -- Step 1: collect lightweight icon state (no extra combat logic – DoiteConditions owns that)
     for i = 1, total do
-        local key  = ordered[i].key
-        local data = ordered[i].data
+        local key  = keyList[i]
+        local data = DoiteAurasDB.spells[key]
         local typ  = data and data.type or "Ability"
 
         local displayName = (data and (data.displayName or data.name)) or key
-        local cache       = DA_Cache()
 
         -- Start from any cached/saved texture
         local tex = cache[displayName]
@@ -1677,7 +1767,14 @@ local function RefreshIcons()
 
         -- For Abilities only: single cheap fallback via spell slot (Nampower-accelerated)
         if not tex and typ == "Ability" then
-            local slot = FindSpellBookSlot(displayName)
+            local slot = slotCache[displayName]
+            if slot == nil then
+                slot = FindSpellBookSlot(displayName)
+                slotCache[displayName] = slot or false
+            elseif slot == false then
+                slot = nil
+            end
+
             if slot and GetSpellTexture then
                 tex = GetSpellTexture(slot, BOOKTYPE_SPELL)
             end
@@ -1692,43 +1789,68 @@ local function RefreshIcons()
         end
 
         -- Show/hide intent comes solely from DoiteConditions via icon flags
-        local f = _G["DoiteIcon_" .. key]
+        local f = (DoiteAuras_GetIconFrame and DoiteAuras_GetIconFrame(key)) or _G["DoiteIcon_" .. key]
         local wants = false
         if f then
             wants = (f._daShouldShow == true) or (f._daSliding == true)
         end
 
-        local candidate = {
-            key  = key,
-            data = data,
-            show = wants,
-            tex  = tex,
-            size = (data and (data.iconSize or data.size)) or 36,
-        }
+        n = n + 1
+        local candidate = pool[n]
+        if not candidate then
+            candidate = {}
+            pool[n] = candidate
+        end
+
+        -- Overwrite all downstream-used fields so reuse can't leak state
+        candidate.key  = key
+        candidate.data = data
+        candidate.show = wants
+        candidate.tex  = tex
+        candidate.size = (data and (data.iconSize or data.size)) or 36
+        candidate._computedPos = nil
 
         -- Stamp the logical bucket this icon belongs to (group/category/ungrouped)
         candidate.bucketKey = DA_GetBucketKeyForCandidate(candidate)
 
-        table.insert(candidates, candidate)
+        candidates[n] = candidate
+    end
+
+    -- Trim old references so candidates[] doesn't keep stale pooled entries alive
+    for i = n + 1, oldN do
+        candidates[i] = nil
     end
 
     -- Step 2: ensure icons exist first, then apply group layout once
     for _, entry in ipairs(candidates) do
-        if not _G["DoiteIcon_" .. entry.key] then
+        if not (DoiteAuras_GetIconFrame and DoiteAuras_GetIconFrame(entry.key)) then
             CreateOrUpdateIcon(entry.key, 36)
         end
     end
 
-    -- For layout: exclude icons in disabled buckets so groups don't account for them
+    -- exclude icons in disabled buckets so groups don't account for them
     local layoutCandidates = candidates
     if DoiteGroup and DoiteGroup.ApplyGroupLayout then
-        layoutCandidates = {}
+        local lc = DoiteAuras._layoutCandidates
+        if not lc then
+            lc = {}
+            DoiteAuras._layoutCandidates = lc
+        end
+
+        local oldLC = table.getn(lc)
+        local nLC = 0
         for _, entry in ipairs(candidates) do
             local bkey = entry.bucketKey
             if not (bkey and DA_IsBucketDisabled(bkey)) then
-                table.insert(layoutCandidates, entry)  -- same tables, just a filtered view
+                nLC = nLC + 1
+                lc[nLC] = entry
             end
         end
+        for i = nLC + 1, oldLC do
+            lc[i] = nil
+        end
+
+        layoutCandidates = lc
     end
 
     if DoiteGroup and not _G["DoiteGroup_LayoutInProgress"] and DoiteGroup.ApplyGroupLayout then
@@ -1743,19 +1865,29 @@ local function RefreshIcons()
 			local d = e.data
 			if d and d.group and d.group ~= "" and d.group ~= "no" and e._computedPos then
 				map[d.group] = map[d.group] or {}
-				-- store/replace entry for this key
 				local list = map[d.group]
+
+				-- Update in-place to avoid allocating new tables each refresh
 				local found = false
-				for i=1, table.getn(list) do
-					if list[i].key == e.key then
-						list[i] = { key = e.key, _computedPos = {
-							x = e._computedPos.x, y = e._computedPos.y, size = e._computedPos.size
-						} }
+				for i = 1, table.getn(list) do
+					local li = list[i]
+					if li and li.key == e.key then
+						li.key = e.key
+						local p = li._computedPos
+						if not p then
+							p = {}
+							li._computedPos = p
+						end
+						p.x = e._computedPos.x
+						p.y = e._computedPos.y
+						p.size = e._computedPos.size
 						found = true
 						break
 					end
 				end
+
 				if not found then
+					-- First time this key is seen in this group: create once (same data shape as before)
 					table.insert(list, { key = e.key, _computedPos = {
 						x = e._computedPos.x, y = e._computedPos.y, size = e._computedPos.size
 					}})
@@ -1769,10 +1901,20 @@ local function RefreshIcons()
     if _G["DoiteAuras_RefreshInProgress"] then return end
     _G["DoiteAuras_RefreshInProgress"] = true
 
+    local cache = DA_Cache()
+
     for _, entry in ipairs(candidates) do
         local key, data = entry.key, entry.data
-        local globalName = "DoiteIcon_" .. key
-        local f = _G[globalName]
+
+        -- Prefer the local icons[] cache to avoid per-icon string concat + _G lookup
+        local f = (icons and icons[key]) or nil
+        if not f then
+            -- Rare fallback: pick up an existing global frame if icons[] was reset
+            f = _G["DoiteIcon_" .. key]
+            if f and icons then
+                icons[key] = f
+            end
+        end
 
         if not f then
             f = CreateOrUpdateIcon(key, 36)
@@ -1830,7 +1972,6 @@ local function RefreshIcons()
         end
 
         -- Texture handling (with saved iconTexture fallback; no extra game queries here)
-        local cache       = DA_Cache()
         local displayName = (data and (data.displayName or data.name)) or key
         local texToUse    = entry.tex
                           or cache[displayName]
@@ -2884,36 +3025,63 @@ RebuildOrder(); RefreshList(); RefreshIcons()
 DoiteAuras_RefreshList  = RefreshList
 DoiteAuras_RefreshIcons = RefreshIcons
 
+-- Reusable candidate list/pool
+local _daCandidates_list = {}
+local _daCandidates_pool = {}
+
+local function _daClearArray(t)
+    local i = 1
+    while t[i] ~= nil do
+        t[i] = nil
+        i = i + 1
+    end
+end
+
 function DoiteAuras.GetAllCandidates()
     if DA_IsHardDisabled and DA_IsHardDisabled() then
         return {}
-    end   
-    local list = {}
-    local editKey = _G["DoiteEdit_CurrentKey"]
-    local editFrame = _G["DoiteEdit_Frame"] or _G["DoiteEditMain"] or _G["DoiteEdit"]
-    local editOpen = (editFrame and editFrame.IsShown and editFrame:IsShown() == 1)
+    end
 
+    local list = _daCandidates_list
+    local pool = _daCandidates_pool
+    _daClearArray(list)
+
+    local editKey   = _G["DoiteEdit_CurrentKey"]
+    local editFrame = _G["DoiteEdit_Frame"] or _G["DoiteEditMain"] or _G["DoiteEdit"]
+    local editOpen  = (editFrame and editFrame.IsShown and editFrame:IsShown() == 1)
+
+    local n = 0
     for key, data in pairs(DoiteAurasDB.spells or {}) do
         -- Skip entries whose bucket is disabled, unless the helper doesn't exist
         if (not DoiteAuras_IsKeyDisabled) or (not DoiteAuras_IsKeyDisabled(key)) then
-            local f = _G["DoiteIcon_" .. key]
-            -- Intent-based visibility: conditions OR active slide
+            local f = (DoiteAuras_GetIconFrame and DoiteAuras_GetIconFrame(key)) or _G["DoiteIcon_" .. key]
+
             local wants = false
             if f then
                 wants = (f._daShouldShow == true) or (f._daSliding == true)
             end
             -- While editing: force the edited key into the pool so groups can place it
-            if editOpen and editKey == key then wants = true end
+            if editOpen and editKey == key then
+                wants = true
+            end
 
-            table.insert(list, {
-                key  = key,
-                data = data,
-                show = wants,
-                tex  = (f and f.icon and f.icon:GetTexture()) or nil,
-                size = data.iconSize or data.size or 36,
-            })
+            n = n + 1
+            local e = pool[n]
+            if not e then
+                e = {}
+                pool[n] = e
+            end
+
+            e.key  = key
+            e.data = data
+            e.show = wants
+            e.tex  = (f and f.icon and f.icon:GetTexture()) or nil
+            e.size = data.iconSize or data.size or 36
+
+            list[n] = e
         end
     end
+
     return list
 end
 

@@ -1,11 +1,35 @@
 ---------------------------------------------------------------
 -- DoiteTrack.lua
 -- Dynamic aura duration recorder + runtime remaining-time API
+-- Please respect license note: Ask permission
 -- WoW 1.12 | Lua 5.0
 ---------------------------------------------------------------
 
 local DoiteTrack = {}
 _G["DoiteTrack"] = DoiteTrack
+
+-- Forward declarations (these are used before the utility section is defined)
+local _playerGUID_cached
+local _GetPlayerGUID
+
+function DoiteTrack:_OnPlayerLogin()
+    UnitExists   = _G.UnitExists
+    GetUnitField = _G.GetUnitField
+    SpellInfo    = _G.SpellInfo
+
+    -- Nampower: enable AuraCast events
+    local SetCVar = _G.SetCVar
+    if SetCVar then
+        pcall(SetCVar, "NP_EnableAuraCastEvents", "1")
+    end
+
+    _playerGUID_cached = nil
+    _GetPlayerGUID()
+    self:RebuildWatchList()
+
+    -- profile signature + arm correction checks
+    self:_OnProfileMaybeChanged("entering_world")
+end
 
 ---------------------------------------------------------------
 -- DB wiring
@@ -23,8 +47,16 @@ local function _GetDB()
     db.trackedDurationsCP   = db.trackedDurationsCP   or {}  -- [spellId] = { [cp] = seconds }
     db.trackedDurationsMeta = db.trackedDurationsMeta or {}  -- meta info (name, rank, samples, etc.)
 
+    -- correction layer (talents/gear) overrides DBC when present. These are temporary: wiped when gear/talents signature changes.
+    db.correctedDurations     = db.correctedDurations     or {}  -- [spellId] = seconds (rounded)
+    db.correctedDurationsCP   = db.correctedDurationsCP   or {}  -- [spellId] = { [cp] = seconds (rounded) }
+    db.correctedChecked       = db.correctedChecked       or {}  -- [spellId] = true (checked this profile/session; may or may not need override)
+    db.correctedCheckedCP     = db.correctedCheckedCP     or {}  -- [spellId] = { [cp] = true }
+    db.correctedProfileSig    = db.correctedProfileSig    or nil -- string signature for gear+talents
+
     return db
 end
+
 
 -- Global maps
 local TrackedBySpellId      = {}  -- [spellId] = entry
@@ -60,9 +92,6 @@ local function _Print(msg, r, g, b)
     end
 end
 
--- Player GUID cache (for SuperWoW's UnitExists return)
-local _playerGUID_cached = nil
-
 local function _GetUnitGuidSafe(unit)
     if not unit or not UnitExists then
         return nil
@@ -77,7 +106,7 @@ local function _GetUnitGuidSafe(unit)
     return nil
 end
 
-local function _GetPlayerGUID()
+_GetPlayerGUID = function()
     if _playerGUID_cached then
         return _playerGUID_cached
     end
@@ -126,6 +155,167 @@ local function _FindUnitByGuid(guid)
     end
 
     return nil
+end
+
+local function _UnitExistsFlag(unit)
+    if not UnitExists then return false end
+    local e = UnitExists(unit)
+    return (e == 1 or e == true)
+end
+
+---------------------------------------------------------------
+-- DBC correction layer (talents/gear) - runtime flags + signature
+---------------------------------------------------------------
+local _debugCorrections = false
+local _correctionSeenThisSession = {}
+local _lastProfileSig = nil
+
+local function _CorrectionKey(spellId, cp, baseRounded)
+    return tostring(tonumber(spellId) or 0) .. ":" .. tostring(tonumber(cp) or 0) .. ":" .. tostring(tonumber(baseRounded) or 0)
+end
+
+local function _DebugCorrection(msg)
+    if _debugCorrections then
+        _Print("|cff6FA8DCDoiteAuras:|r (corr) " .. (msg or ""))
+    end
+end
+
+_G["DoiteTrack_SetCorrectionDebug"] = function(on)
+    _debugCorrections = (on and true or false)
+    if _debugCorrections then
+        _Print("|cff6FA8DCDoiteAuras:|r correction debug |cffffff00ON|r")
+    else
+        _Print("|cff6FA8DCDoiteAuras:|r correction debug |cffffff00OFF|r")
+    end
+end
+
+local function _GetProfileSignature()
+    local parts = {}
+
+    -- Gear signature (slot itemIDs)
+    local GetInventoryItemLink = _G.GetInventoryItemLink
+    if GetInventoryItemLink then
+        local slot
+        for slot = 1, 19 do
+            local link = GetInventoryItemLink("player", slot)
+            local id = "0"
+			if link and type(link) == "string" then
+				local _, _, m = string.find(link, "item:(%d+)")
+				if m and m ~= "" then id = m end
+			end
+            parts[table.getn(parts) + 1] = id
+        end
+    else
+        parts[table.getn(parts) + 1] = "nogearapi"
+    end
+
+    parts[table.getn(parts) + 1] = "|"
+
+    -- Talent signature (all ranks)
+    local GetNumTalentTabs = _G.GetNumTalentTabs
+    local GetNumTalents    = _G.GetNumTalents
+    local GetTalentInfo    = _G.GetTalentInfo
+
+    if GetNumTalentTabs and GetNumTalents and GetTalentInfo then
+        local tabs = 0
+        local okTabs, vTabs = pcall(GetNumTalentTabs)
+        if okTabs and type(vTabs) == "number" then
+            tabs = vTabs
+        end
+
+        local tab
+        for tab = 1, tabs do
+            local num = 0
+            local okNum, vNum = pcall(GetNumTalents, tab)
+            if okNum and type(vNum) == "number" then
+                num = vNum
+            end
+
+            local t
+            for t = 1, num do
+                local okInfo, n, ico, tier, col, curRank = pcall(GetTalentInfo, tab, t)
+                local r = 0
+                if okInfo and type(curRank) == "number" then
+                    r = curRank
+                end
+                parts[table.getn(parts) + 1] = tostring(r)
+            end
+            parts[table.getn(parts) + 1] = "|"
+        end
+    else
+        parts[table.getn(parts) + 1] = "notalentsapi"
+    end
+
+    return table.concat(parts, ",")
+end
+
+local function _ResetCorrectionsForNewProfile(db, reason)
+    -- Keep corrected overrides; they remain in effect until re-tested.
+    db.correctedChecked     = {}
+    db.correctedCheckedCP   = {}
+
+    for k in pairs(_correctionSeenThisSession) do
+        _correctionSeenThisSession[k] = nil
+    end
+
+    _DebugCorrection("profile changed ("..tostring(reason)..") -> kept corrected durations; cleared checked & session cache")
+end
+
+local function _ArmCorrections(reason)
+    -- Once per entering world and again after gear/talent changes
+    for k in pairs(_correctionSeenThisSession) do
+        _correctionSeenThisSession[k] = nil
+    end
+    _lastProfileSig = tostring(reason or "unknown") .. "@" .. tostring(GetTime and GetTime() or 0)
+    _DebugCorrection("armed correction checks ("..tostring(reason)..")")
+end
+
+function DoiteTrack:_OnProfileMaybeChanged(reason)
+    local db = _GetDB()
+    local sig = _GetProfileSignature()
+    if not sig or sig == "" then
+        _ArmCorrections(reason or "unknown")
+        return
+    end
+
+    local prev = db.correctedProfileSig
+    if prev ~= sig then
+        db.correctedProfileSig = sig
+        _ResetCorrectionsForNewProfile(db, reason or "unknown")
+    else
+        _DebugCorrection("profile unchanged ("..tostring(reason)..")")
+    end
+
+    _ArmCorrections(reason or "unknown")
+end
+
+local ProfileFrame = CreateFrame("Frame", "DoiteTrackProfileFrame")
+local _profileRescanAt = nil
+local _profileRescanReason = nil
+
+local function _ScheduleProfileRescan(reason)
+    local now = GetTime and GetTime() or 0
+    _profileRescanReason = reason or "spellbook_change"
+    _profileRescanAt = now + 0.35
+
+    if ProfileFrame._active then
+        return
+    end
+
+    ProfileFrame._active = true
+    ProfileFrame:SetScript("OnUpdate", function()
+        local t = GetTime and GetTime() or 0
+        if _profileRescanAt and t >= _profileRescanAt then
+            ProfileFrame._active = false
+            ProfileFrame:SetScript("OnUpdate", nil)
+
+            local r = _profileRescanReason
+            _profileRescanAt = nil
+            _profileRescanReason = nil
+
+            DoiteTrack:_OnProfileMaybeChanged(r)
+        end
+    end)
 end
 
 ---------------------------------------------------------------
@@ -322,12 +512,39 @@ local function _GetTrackedCPDuration(spellId, cp)
     return t[cp]
 end
 
+-- corrected-duration override (talents/gear)
+local function _GetCorrectedFlatDuration(spellId)
+    local db = _GetDB()
+    return db.correctedDurations[spellId]
+end
+
+local function _GetCorrectedCPDuration(spellId, cp)
+    if not cp or cp <= 0 then return nil end
+    local db = _GetDB()
+    local t = db.correctedDurationsCP[spellId]
+    if not t then return nil end
+    return t[cp]
+end
+
 -- Baseline duration lookup in priority order:
+--  0) Corrected override (talents/gear) if present
 --  1) DBC duration via SpellDuration.dbc (durationIndex -> SpellDurationSec)
 --  2) CP-specific tracked duration (if cp > 0)
 --  3) Flat tracked duration (no CP)
 local function _GetBaselineDuration(spellId, cp)
     local d
+
+    -- 0) Corrected override (if known)
+    if cp and cp > 0 then
+        d = _GetCorrectedCPDuration(spellId, cp)
+        if d and d > 0 then
+            return d
+        end
+    end
+    d = _GetCorrectedFlatDuration(spellId)
+    if d and d > 0 then
+        return d
+    end
 
     -- 1) Static DBC duration (optionally CP-specific), if available
     d = _GetDBCBaseDuration(spellId, cp)
@@ -456,11 +673,17 @@ local function _AddTrackedFromEntry(key, data)
     end
 
     -- Only track explicit "only mine" auras, and only if they target something
+    -- Only track explicit ownership-based auras, and only if they target something
     local onlyMine   = (c.onlyMine == true)
     local onlyOthers = (c.onlyOthers == true)
     local hasTarget  = (c.targetSelf or c.targetHelp or c.targetHarm)
 
     if not hasTarget then
+        return
+    end
+
+
+    if (not onlyMine) and (not onlyOthers) then
         return
     end
 
@@ -646,13 +869,31 @@ local function _RecordAuraForSession(session)
     local bucket = _GetAuraBucketForGuid(session.targetGuid, true)
     if not bucket then return end
 
-    bucket[session.spellId] = {
-        appliedAt = session.appliedAt or session.startedAt,
-        lastSeen  = session.lastSeen or session.appliedAt or session.startedAt,
-        fullDur   = _GetBaselineDuration(session.spellId, session.cp),
-        cp        = session.cp or 0,
-        isDebuff  = (session.isDebuff == true),
-    }
+    local sid = session.spellId
+    local a = bucket[sid]
+    if not a then
+        a = {}
+        bucket[sid] = a
+    end
+
+    local applied = session.appliedAt or session.startedAt
+    local seen    = session.lastSeen or session.appliedAt or session.startedAt
+
+    a.appliedAt = applied
+    a.lastSeen  = seen
+    a.cp        = session.cp or 0
+    a.isDebuff  = (session.isDebuff == true)
+
+    -- Cache baseline duration so we don't re-query DB/DBC every tick
+    local dur = session.fullDur
+    if not dur or dur <= 0 then
+        dur = a.fullDur
+    end
+    if not dur or dur <= 0 then
+        dur = _GetBaselineDuration(sid, a.cp)
+        session.fullDur = dur
+    end
+    a.fullDur = dur
 end
 
 -- Find any active session for (spellId, targetGuid)
@@ -667,11 +908,19 @@ local function _FindSessionFor(spellId, targetGuid)
     return nil, nil
 end
 
+local _NotifyCorrectionApplied
+local _NotifyCorrectionCleared
+
 local function _AbortSession(session, reason)
     if not session or session.aborted or session.complete then return end
     session.aborted      = true
     session.abortReason  = reason or "unknown"
     _ClearAuraForSession(session)
+
+    -- do not keep dead sessions around
+    if session.id then
+        ActiveSessions[session.id] = nil
+    end
 end
 
 local function _FinishSession(session, finalDuration)
@@ -682,7 +931,6 @@ local function _FinishSession(session, finalDuration)
 
     ----------------------------------------------------------------
     -- Special handling for damage-origin auras like Deep Wounds
-    -- that can be kept rolling far beyond their base duration.
     ----------------------------------------------------------------
     if session.source == "damage" and session.spellName then
         local norm = _NormSpellName(session.spellName)
@@ -696,13 +944,162 @@ local function _FinishSession(session, finalDuration)
         end
     end
 
-    ----------------------------------------------------------------
-    -- Normal completion & commit
-    ----------------------------------------------------------------
     session.complete      = true
     session.finalDuration = finalDuration
 
-    -- Only learn / persist when this spell actually needs recording.
+    ----------------------------------------------------------------
+    -- correction-mode commit (overrides DBC if different)
+    ----------------------------------------------------------------
+    if session.correctMode then
+        local db = _GetDB()
+        local spellId = session.spellId
+        local cp = session.cp or 0
+
+        local measuredRounded = math.floor(finalDuration + 0.5)
+
+        local baseKind = session.correctBaseKind
+        local baseRounded = session.correctBaseRounded
+
+        -- Fallback (in case older session structs exist)
+        if not baseKind then baseKind = "dbc" end
+        if not baseRounded or baseRounded <= 0 then
+            if baseKind == "dbc" or baseKind == "corr" then
+                local baseDBC = _GetDBCBaseDuration(spellId, cp)
+                baseRounded = baseDBC and math.floor(baseDBC + 0.5) or nil
+            else
+                local t = nil
+                if cp > 0 then t = _GetTrackedCPDuration(spellId, cp) end
+                if not t then t = _GetTrackedFlatDuration(spellId) end
+                baseRounded = t and math.floor(t + 0.5) or nil
+            end
+        end
+
+        -- Track "seen" - don't spam within the same armed window (per baselineRounded)
+        local key = _CorrectionKey(spellId, cp, baseRounded or 0)
+        _correctionSeenThisSession[key] = true
+
+        if baseRounded and baseRounded > 0 then
+
+            -- If DBC exists for this spell, correction logic is "DBC correction" regardless of whether started from DBC or from an existing correction value.
+            local baseDBC = _GetDBCBaseDuration(spellId, cp)
+            local dbcRounded = (baseDBC and baseDBC > 0) and math.floor(baseDBC + 0.5) or nil
+
+            if dbcRounded and dbcRounded > 0 then
+                -- mark checked for this profile
+                if cp > 0 then
+                    db.correctedCheckedCP[spellId] = db.correctedCheckedCP[spellId] or {}
+                    db.correctedCheckedCP[spellId][cp] = true
+                else
+                    db.correctedChecked[spellId] = true
+                end
+
+                -- Ensure this spell can be cleared by name later
+                db.trackedDurationsMeta[spellId] = db.trackedDurationsMeta[spellId] or {}
+                if session.correctDisplayName and session.correctDisplayName ~= "" then
+                    db.trackedDurationsMeta[spellId].name = session.correctDisplayName
+                elseif session.spellName and session.spellName ~= "" then
+                    db.trackedDurationsMeta[spellId].name = session.spellName
+                end
+                if session.spellRank and session.spellRank ~= "" then
+                    db.trackedDurationsMeta[spellId].rank = session.spellRank
+                end
+
+                -- Current saved correction (if any)
+                local corrNow = nil
+                if cp > 0 then
+                    corrNow = db.correctedDurationsCP[spellId] and db.correctedDurationsCP[spellId][cp]
+                else
+                    corrNow = db.correctedDurations[spellId]
+                end
+
+                local function _ClearCorr()
+                    if cp > 0 and db.correctedDurationsCP[spellId] then
+                        db.correctedDurationsCP[spellId][cp] = nil
+                        if not next(db.correctedDurationsCP[spellId]) then
+                            db.correctedDurationsCP[spellId] = nil
+                        end
+                    else
+                        db.correctedDurations[spellId] = nil
+                    end
+                end
+
+                -- If a stale correction equals DBC, silently drop it (no player-facing change).
+                if corrNow and corrNow == dbcRounded then
+                    _ClearCorr()
+                    corrNow = nil
+                end
+
+                -- 1) already had a correction and the measured matches it: do NOTHING (no writes, no chat).
+                if corrNow and measuredRounded == corrNow then
+                    -- silent
+
+                else
+                    -- 2) If measured matches DBC: remove correction if it existed (notify only on actual reset)
+                    if measuredRounded == dbcRounded then
+                        if corrNow then
+                            _ClearCorr()
+                            if session.correctDisplayName or session.spellName then
+                                _NotifyCorrectionCleared(session.kind, session.correctDisplayName or session.spellName, measuredRounded, dbcRounded)
+                            end
+                        end
+
+                    -- 3) Otherwise: save/overwrite correction (notify only when value actually changes)
+                    else
+                        if cp > 0 then
+                            db.correctedDurationsCP[spellId] = db.correctedDurationsCP[spellId] or {}
+                            db.correctedDurationsCP[spellId][cp] = measuredRounded
+                        else
+                            db.correctedDurations[spellId] = measuredRounded
+                        end
+
+                        if session.correctDisplayName or session.spellName then
+                            _NotifyCorrectionApplied(session.kind, session.correctDisplayName or session.spellName, measuredRounded, dbcRounded)
+                        end
+                    end
+                end
+
+            else
+                -- -------------------------
+                -- Recheck learned (non-DBC) durations after profile changes
+                -- -------------------------
+                if measuredRounded ~= baseRounded then
+                    if cp > 0 then
+                        db.trackedDurationsCP[spellId] = db.trackedDurationsCP[spellId] or {}
+                        db.trackedDurationsCP[spellId][cp] = measuredRounded
+                    else
+                        db.trackedDurations[spellId] = measuredRounded
+                    end
+
+                    _Print(string.format(
+                        "|cff6FA8DCDoiteAuras:|r |cffffff00%s|r updated learned duration: |cffffff00%ds|r (was %ds).",
+                        tostring(session.correctDisplayName or session.spellName or ("Spell "..tostring(spellId))),
+                        measuredRounded,
+                        baseRounded
+                    ))
+                else
+                    _DebugCorrection(string.format(
+                        "learned OK id=%d cp=%d stored=%d measured=%d",
+                        spellId, cp, baseRounded, measuredRounded
+                    ))
+                end
+            end
+
+        else
+            _DebugCorrection("skip correction: no base duration for id="..tostring(spellId).." cp="..tostring(cp))
+        end
+
+        _RecordAuraForSession(session)
+
+        -- finished sessions shouldn't stay in ActiveSessions
+        if session.id then
+            ActiveSessions[session.id] = nil
+        end
+        return
+    end
+
+    ----------------------------------------------------------------
+    -- Normal completion & commit (existing behavior)
+    ----------------------------------------------------------------
     if session.willRecord then
         _CommitDuration(
             session.spellId,
@@ -713,8 +1110,12 @@ local function _FinishSession(session, finalDuration)
         )
     end
 
-    -- Always refresh runtime bucket so remaining-time API stays correct.
     _RecordAuraForSession(session)
+
+    -- finished sessions shouldn't stay in ActiveSessions
+    if session.id then
+        ActiveSessions[session.id] = nil
+    end
 end
 
 ---------------------------------------------------------------
@@ -727,6 +1128,12 @@ local function _ClearAllTrackedDurations()
     db.trackedDurations     = {}
     db.trackedDurationsCP   = {}
     db.trackedDurationsMeta = {}
+
+    -- Wipe corrected overrides
+    db.correctedDurations   = {}
+    db.correctedDurationsCP = {}
+    db.correctedChecked     = {}
+    db.correctedCheckedCP   = {}
 
     -- Wipe runtime state so nothing uses old data
     local k
@@ -762,6 +1169,20 @@ local function _ClearTimersForSpellId(spellId)
     if db.trackedDurationsMeta[spellId] then
         db.trackedDurationsMeta[spellId] = nil
         removedIds = removedIds + 1
+    end
+	    if db.correctedDurations[spellId] then
+        db.correctedDurations[spellId] = nil
+        removedIds = removedIds + 1
+    end
+    if db.correctedDurationsCP[spellId] then
+        db.correctedDurationsCP[spellId] = nil
+        removedIds = removedIds + 1
+    end
+    if db.correctedChecked[spellId] then
+        db.correctedChecked[spellId] = nil
+    end
+    if db.correctedCheckedCP[spellId] then
+        db.correctedCheckedCP[spellId] = nil
     end
 
     -- Wipe runtime state only for this spellId
@@ -802,6 +1223,12 @@ local function _ClearTimersForName(normName)
             db.trackedDurations[spellId]      = nil
             db.trackedDurationsCP[spellId]    = nil
             db.trackedDurationsMeta[spellId]  = nil
+
+            db.correctedDurations[spellId]    = nil
+            db.correctedDurationsCP[spellId]  = nil
+            db.correctedChecked[spellId]      = nil
+            db.correctedCheckedCP[spellId]    = nil
+
             clearedIds[spellId] = true
         end
     end
@@ -876,39 +1303,99 @@ local function _GetUnitAuraTable(unit, isDebuff)
     if not GetUnitField then return nil end
 
     local function getFieldTable(fieldName)
-        -- Try copy=1 first (safe to store/iterate)
+
+        local cache = _G["DoiteTrack_AuraFieldCache"]
+        if not cache then
+            cache = {}
+            _G["DoiteTrack_AuraFieldCache"] = cache
+        end
+
+        local gt = _G.GetTime
+        local now = 0
+        if gt then
+            now = gt()
+        end
+
+        -- 0.1s tick id
+        local tick = math.floor(now * 10)
+        if cache._tick ~= tick then
+            cache._tick = tick
+            cache._gen = (cache._gen or 0) + 1
+        end
+        local gen = cache._gen or 0
+
+        local u = cache[unit]
+        if type(u) ~= "table" then
+            u = {}
+            cache[unit] = u
+        end
+
+        local f = u[fieldName]
+        if type(f) ~= "table" then
+            f = {}
+            u[fieldName] = f
+        end
+
+        -- 1) Try copy=1 (cached)
+        if f._g1 == gen then
+            local v = f._v1
+            if v == false then return nil end
+            return v
+        end
+
         local ok, t = pcall(GetUnitField, unit, fieldName, 1)
         if ok and type(t) == "table" then
+            f._g1 = gen
+            f._v1 = t
             return t
         end
 
-        -- Fallback: older API builds may not accept the copy param
+        f._g1 = gen
+        f._v1 = false
+
+        -- 2) Fallback: no-copy (cached)
+        if f._g0 == gen then
+            local v2 = f._v0
+            if v2 == false then return nil end
+            return v2
+        end
+
         ok, t = pcall(GetUnitField, unit, fieldName)
         if ok and type(t) == "table" then
+            f._g0 = gen
+            f._v0 = t
             return t
         end
 
+        f._g0 = gen
+        f._v0 = false
         return nil
     end
 
-    -- Primary field used in this addon so far
-    local t = getFieldTable("aura")
-    if t then return t end
+    local t
 
-    -- Fallbacks (harmless if unsupported)
     if isDebuff then
         t = getFieldTable("debuff")
         if t then return t end
+        t = getFieldTable("aura")
+        if t then return t end
+        -- last resort
+        t = getFieldTable("buff")
+        if t then return t end
     else
         t = getFieldTable("buff")
+        if t then return t end
+        t = getFieldTable("aura")
+        if t then return t end
+        -- last resort
+        t = getFieldTable("debuff")
         if t then return t end
     end
 
     return nil
 end
 
--- Discover and cache spellIds for an entry by scanning the unit’s aura spellIds,
--- resolving spell name from spellId, and matching normalized name.
+-- Discover and cache spellIds for an entry by scanning the unit’s aura spellIds, resolving spell name from spellId, and matching normalized name.
 local function _CacheMatchingAuraIdsOnUnit(entry, unit)
     if not entry or not entry.normName or not unit then
         return nil
@@ -921,25 +1408,52 @@ local function _CacheMatchingAuraIdsOnUnit(entry, unit)
 
     local foundSid = nil
 
+    -- Global spellId->normalized-name cache
+    local normCache = _G["DoiteTrack_SpellNormCache"]
+    if not normCache then
+        normCache = {}
+        _G["DoiteTrack_SpellNormCache"] = normCache
+    end
+
     local function considerSpellId(raw)
         local sid = tonumber(raw) or 0
         if sid <= 0 then return end
 
-        local n = nil
-        if GetSpellNameAndRankForId then
-            local ok, nn = pcall(GetSpellNameAndRankForId, sid)
-            if ok and nn and nn ~= "" then
-                n = nn
-            end
-        end
-        if (not n or n == "") and SpellInfo then
-            local nn = SpellInfo(sid)
-            if type(nn) == "string" and nn ~= "" then
-                n = nn
-            end
+        -- If already known for this entry, just ensure first-found and exit.
+        if entry.spellIds and entry.spellIds[sid] then
+            TrackedBySpellId[sid] = entry
+            if not foundSid then foundSid = sid end
+            return
         end
 
-        local norm = _NormSpellName(n)
+        local norm = normCache[sid]
+
+        -- Cache miss: resolve name -> normalize -> store (store false for "unknown")
+        if norm == nil then
+            local n = nil
+
+            if GetSpellNameAndRankForId then
+                local ok, nn = pcall(GetSpellNameAndRankForId, sid)
+                if ok and nn and nn ~= "" then
+                    n = nn
+                end
+            end
+
+            if (not n or n == "") and SpellInfo then
+                local nn = SpellInfo(sid)
+                if type(nn) == "string" and nn ~= "" then
+                    n = nn
+                end
+            end
+
+            norm = _NormSpellName(n)
+            if not norm or norm == "" then
+                norm = false
+            end
+
+            normCache[sid] = norm
+        end
+
         if norm and norm == entry.normName then
             entry.spellIds = entry.spellIds or {}
             entry.spellIds[sid] = true
@@ -962,7 +1476,6 @@ local function _CacheMatchingAuraIdsOnUnit(entry, unit)
     -- Hash/other-style
     local k, v
     for k, v in pairs(auras) do
-        -- if table is { [spellId]=true } or { [1]=spellId, ... } handle both
         considerSpellId(k)
         considerSpellId(v)
     end
@@ -982,38 +1495,117 @@ local function _AuraHasSpellId(unit, spellId, isDebuff)
         return false
     end
 
-    -- Hash case: auras[spellId] == true
+    -- Fast hash hit
     if auras[spellId] then
         return true
     end
 
-    -- Array case
-    local n = table.getn(auras)
-    if n and n > 0 then
-        local i
-        for i = 1, n do
-            if auras[i] == spellId then
-                return true
+    local cache = _G["DoiteTrack_AuraHasCache"]
+    if not cache then
+        cache = {}
+        _G["DoiteTrack_AuraHasCache"] = cache
+    end
+
+    -- Use the same tick/gen cadence as the aura-field cache if present, otherwise maintain our own tick/gen.
+    local gen = nil
+    local fieldCache = _G["DoiteTrack_AuraFieldCache"]
+    if fieldCache and fieldCache._gen then
+        gen = fieldCache._gen
+    else
+        local gt = _G.GetTime
+        local now = 0
+        if gt then now = gt() end
+
+        local tick = math.floor(now * 10)
+        if cache._tick ~= tick then
+            cache._tick = tick
+            cache._gen = (cache._gen or 0) + 1
+        end
+        gen = cache._gen or 0
+    end
+
+    local u = cache[unit]
+    if type(u) ~= "table" then
+        u = {}
+        cache[unit] = u
+    end
+
+    local key = isDebuff and "D" or "B"
+
+    local slot = u[key]
+    if type(slot) ~= "table" then
+        slot = {}
+        u[key] = slot
+    end
+
+    local map = slot._map
+    if type(map) ~= "table" then
+        map = {}
+        slot._map = map
+    end
+
+    -- Rebuild once per gen
+    if slot._g ~= gen then
+        slot._g = gen
+
+        local n = table.getn(auras)
+        if n and n > 0 then
+            local i
+            for i = 1, n do
+                local v = tonumber(auras[i])
+                if v and v > 0 then
+                    map[v] = gen
+                end
+            end
+        end
+
+        local k2, v2
+        for k2, v2 in pairs(auras) do
+            local kk = tonumber(k2)
+            if kk and kk > 0 then
+                map[kk] = gen
+            end
+            local vv = tonumber(v2)
+            if vv and vv > 0 then
+                map[vv] = gen
             end
         end
     end
 
-    -- Fallback pairs scan
-    local k, v
-    for k, v in pairs(auras) do
-        if k == spellId or v == spellId then
-            return true
-        end
-    end
-
-    return false
+    return (map[spellId] == gen)
 end
 
----------------------------------------------------------------
 -- Pretty name / rank from spellId using Nampower / SuperWoW
--- (both APIs verified by probe E)
----------------------------------------------------------------
 local function _GetSpellNameRank(spellId)
+    spellId = tonumber(spellId) or 0
+
+    -- Global caches
+    local nameCache = _G["DoiteTrack_SpellNameCache"]
+    if not nameCache then
+        nameCache = {}
+        _G["DoiteTrack_SpellNameCache"] = nameCache
+    end
+
+    local rankCache = _G["DoiteTrack_SpellRankCache"]
+    if not rankCache then
+        rankCache = {}
+        _G["DoiteTrack_SpellRankCache"] = rankCache
+    end
+
+    local cachedName = nameCache[spellId]
+    if cachedName ~= nil then
+        if cachedName == false then
+            return ("Spell " .. tostring(spellId)), nil
+        end
+
+        local cachedRank = rankCache[spellId]
+        if cachedRank == false then
+            cachedRank = nil
+        end
+
+        return cachedName, cachedRank
+    end
+
     local name, rank
 
     if GetSpellNameAndRankForId then
@@ -1035,7 +1627,20 @@ local function _GetSpellNameRank(spellId)
         end
     end
 
-    return name or ("Spell " .. tostring(spellId)), rank
+    if not name or name == "" then
+        nameCache[spellId] = false
+        rankCache[spellId] = false
+        return ("Spell " .. tostring(spellId)), nil
+    end
+
+    nameCache[spellId] = name
+    if rank and rank ~= "" then
+        rankCache[spellId] = rank
+    else
+        rankCache[spellId] = false
+    end
+
+    return name, rank
 end
 
 ---------------------------------------------------------------
@@ -1153,6 +1758,24 @@ local function _NotifyTrackingFinished(spellId, spellName, spellRank, cp, durati
     _Print(copyLine)
 end
 
+_NotifyCorrectionApplied = function(kind, displayName, measuredSec, dbcSec)
+    local label   = "|cff6FA8DCDoiteAuras:|r "
+    local tWhite  = "|cffffffff" .. (kind or "Aura") .. " - " .. "|r"
+    local nYellow = "|cffffff00" .. (displayName or "Unknown") .. "|r"
+    local mYellow = "|cffffff00" .. tostring(measuredSec or "?") .. "s|r"
+    local dYellow = "|cffffff00" .. tostring(dbcSec or "?") .. "s|r"
+    _Print(label .. tWhite .. nYellow .. " corrected duration saved: " .. mYellow .. " (DBC " .. dYellow .. ").")
+end
+
+_NotifyCorrectionCleared = function(kind, displayName, measuredSec, dbcSec)
+    local label   = "|cff6FA8DCDoiteAuras:|r "
+    local tWhite  = "|cffffffff" .. (kind or "Aura") .. " - " .. "|r"
+    local nYellow = "|cffffff00" .. (displayName or "Unknown") .. "|r"
+    local mYellow = "|cffffff00" .. tostring(measuredSec or "?") .. "s|r"
+    local dYellow = "|cffffff00" .. tostring(dbcSec or "?") .. "s|r"
+    _Print(label .. tWhite .. nYellow .. " matches DBC (" .. dYellow .. "); cleared override (measured " .. mYellow .. ").")
+end
+
 ---------------------------------------------------------------
 -- Spell debug helper
 ---------------------------------------------------------------
@@ -1164,19 +1787,78 @@ local function _DebugSpell(spellId, cp, stage)
     if spellId <= 0 then return end
 
     local name, rank = _GetSpellNameRank(spellId)
-    local dbc = _GetDBCBaseDuration(spellId, cp)
-    local flat = _GetTrackedFlatDuration(spellId)
-    local cpDur = (cp and cp > 0) and _GetTrackedCPDuration(spellId, cp) or nil
+
+    -- raw DBC durationIndex (not mapped)
+    local idx = nil
+    if GetSpellRecField then
+        local ok, v = pcall(GetSpellRecField, spellId, "durationIndex")
+        if ok and type(v) == "number" and v > 0 then
+            idx = v
+        end
+    end
+
+    local dbc    = _GetDBCBaseDuration(spellId, cp)
+    local flat   = _GetTrackedFlatDuration(spellId)
+    local cpDur  = (cp and cp > 0) and _GetTrackedCPDuration(spellId, cp) or nil
+
+    local corr = nil
+    if cp and cp > 0 then
+        corr = _GetCorrectedCPDuration(spellId, cp)
+    else
+        corr = _GetCorrectedFlatDuration(spellId)
+    end
+
     local willRecord = _ShouldRecord(spellId, cp)
 
+    local entry = TrackedBySpellId[spellId]
+    local selfOnly = false
+    if entry then
+        selfOnly = (entry.trackSelf and (not entry.trackHelp) and (not entry.trackHarm))
+    end
+
+    -- Would correction test run again right now?
+    local baseKind, baseR = nil, nil
+    local corrTest = false
+    local seen = nil
+
+    if (not willRecord) and entry and entry.onlyMine and (entry.trackHelp or entry.trackHarm) and (not selfOnly) then
+        if corr and corr > 0 then
+            baseKind = "corr"
+            baseR = math.floor(corr + 0.5)
+        elseif dbc and dbc > 0 then
+            baseKind = "dbc"
+            baseR = math.floor(dbc + 0.5)
+        else
+            local stored = cpDur
+            if not stored then stored = flat end
+            if stored and stored > 0 then
+                baseKind = "tracked"
+                baseR = math.floor(stored + 0.5)
+            end
+        end
+
+        if baseR and baseR > 0 and baseR < 600 then
+            local key = _CorrectionKey(spellId, cp, baseR)
+            seen = _correctionSeenThisSession[key] and true or false
+            corrTest = (not seen)
+        end
+    end
+
     _Print(string.format(
-        "DoiteTrackDBG[%s]: id=%d name=%s cp=%d dbc=%s flat=%s cpDur=%s record=%s",
+        "DoiteTrackDBG[%s]: id=%d name=%s cp=%d idx=%s dbc=%s tracked(flat=%s cp=%s) corr=%s willRecord=%s corrTest=%s baseKind=%s base=%s seen=%s arm=%s",
         stage or "?", spellId, tostring(name),
         cp or 0,
+        tostring(idx),
         tostring(dbc),
         tostring(flat),
         tostring(cpDur),
-        tostring(willRecord)
+        tostring(corr),
+        tostring(willRecord),
+        tostring(corrTest),
+        tostring(baseKind),
+        tostring(baseR),
+        tostring(seen),
+        tostring(_lastProfileSig)
     ))
 end
 
@@ -1222,6 +1904,8 @@ local function _EnsureOnUpdateEnabled()
                             _AbortSession(s, "target lost")
                             if s.willRecord then
                                 _NotifyTrackingCancelled(s.spellName, "target lost")
+                            elseif s.correctMode then
+                                _DebugCorrection("cancel: target lost ("..tostring(s.spellId)..")")
                             end
                         end
                     else
@@ -1231,18 +1915,32 @@ local function _EnsureOnUpdateEnabled()
                             _AbortSession(s, "target died")
                             if s.willRecord then
                                 _NotifyTrackingCancelled(s.spellName, "target died")
+                            elseif s.correctMode then
+                                _DebugCorrection("cancel: target died ("..tostring(s.spellId)..")")
                             end
                         else
                             local hasAura = _AuraHasSpellId(unit, s.spellId, s.isDebuff)
 
                             if hasAura then
-                                if not s.appliedAt then
-                                    s.appliedAt = now2
-                                end
-                                s.lastSeen = now2
+                                if s.correctMode and (not s.applyConfirmed) then
+                                    -- Fallback: if AuraCast confirm events aren't delivered, treat first visible aura as confirmed.
+                                    s.applyConfirmed = true
+                                    if not s.appliedAt then
+                                        s.appliedAt = now2
+                                    end
+                                    s.lastSeen = now2
 
-                                -- Keep runtime aura bucket in sync for remaining-time queries.
-                                _RecordAuraForSession(s)
+                                    -- Keep runtime aura bucket in sync for remaining-time queries.
+                                    _RecordAuraForSession(s)
+                                else
+                                    if not s.appliedAt then
+                                        s.appliedAt = now2
+                                    end
+                                    s.lastSeen = now2
+
+                                    -- Keep runtime aura bucket in sync for remaining-time queries.
+                                    _RecordAuraForSession(s)
+                                end
                             else
                                 if s.appliedAt then
                                     local lastSeen = s.lastSeen or s.appliedAt or now2
@@ -1252,6 +1950,8 @@ local function _EnsureOnUpdateEnabled()
                                         _AbortSession(s, "aura faded off-target")
                                         if s.willRecord then
                                             _NotifyTrackingCancelled(s.spellName, "aura faded while not targeted")
+                                        elseif s.correctMode then
+                                            _DebugCorrection("cancel: aura faded while not targeted ("..tostring(s.spellId)..")")
                                         end
                                     else
                                         local dur = lastSeen - s.appliedAt
@@ -1260,6 +1960,7 @@ local function _EnsureOnUpdateEnabled()
                                             if s.willRecord then
                                                 _NotifyTrackingFinished(s.spellId, s.spellName, s.spellRank, s.cp, dur)
                                             end
+                                            -- correction-mode prints only if it actually applied an override (inside _FinishSession)
                                         else
                                             _AbortSession(s, "duration out of range")
                                             if s.willRecord then
@@ -1270,9 +1971,14 @@ local function _EnsureOnUpdateEnabled()
                                 else
                                     local age = now2 - (s.startedAt or now2)
                                     if age > 1.5 then
-                                        _AbortSession(s, "aura never applied")
-                                        if s.willRecord then
-                                            _NotifyTrackingCancelled(s.spellName, "aura never applied")
+                                        if s.correctMode and (not s.applyConfirmed) then
+                                            _AbortSession(s, "no player aura confirm")
+                                            _DebugCorrection("cancel: no player aura confirm ("..tostring(s.spellId)..")")
+                                        else
+                                            _AbortSession(s, "aura never applied")
+                                            if s.willRecord then
+                                                _NotifyTrackingCancelled(s.spellName, "aura never applied")
+                                            end
                                         end
                                     end
                                 end
@@ -1353,8 +2059,17 @@ function DoiteTrack:_OnSpellCastEvent()
         return
     end
 
-    if not targetGuid or targetGuid == "0x000000000" or targetGuid == "0x0000000000000000" then
+    if entry.trackSelf and (not entry.trackHelp) and (not entry.trackHarm) then
         targetGuid = pGuid
+    elseif (not targetGuid) or targetGuid == "" or targetGuid == "0x000000000" or targetGuid == "0x0000000000000000" then
+        local tg = _GetUnitGuidSafe("target")
+        if tg and tg ~= "" then
+            targetGuid = tg
+        elseif entry.trackSelf then
+            targetGuid = pGuid
+        else
+            return
+        end
     end
 
     local cp = 0
@@ -1363,6 +2078,62 @@ function DoiteTrack:_OnSpellCastEvent()
     end
 
     local willRecord = _ShouldRecord(spellId, cp)
+
+    -- correction-mode (recheck baseline once per armed window)
+    local correctMode = false
+    local correctBaseKind = nil
+    local correctBaseRounded = nil
+
+    if (not willRecord) then
+        if entry.onlyMine and (entry.trackHelp or entry.trackHarm) and (not (entry.trackSelf and (not entry.trackHelp) and (not entry.trackHarm))) then
+            -- Order:
+            -- a) correction recording (stored override)
+            -- b) DBC
+            -- c) learned (tracked)
+            local corr = nil
+            if cp and cp > 0 then
+                corr = _GetCorrectedCPDuration(spellId, cp)
+            else
+                corr = _GetCorrectedFlatDuration(spellId)
+            end
+
+            if corr and corr > 0 then
+                correctBaseKind = "corr"
+                correctBaseRounded = math.floor(corr + 0.5)
+            else
+                local baseDBC = _GetDBCBaseDuration(spellId, cp)
+                if baseDBC and baseDBC > 0 then
+                    correctBaseKind = "dbc"
+                    correctBaseRounded = math.floor(baseDBC + 0.5)
+                else
+                    local stored = nil
+                    if cp > 0 then stored = _GetTrackedCPDuration(spellId, cp) end
+                    if not stored then stored = _GetTrackedFlatDuration(spellId) end
+                    if stored and stored > 0 then
+                        correctBaseKind = "tracked"
+                        correctBaseRounded = math.floor(stored + 0.5)
+                    end
+                end
+            end
+
+            if correctBaseRounded and correctBaseRounded > 0 and correctBaseRounded < 600 then
+                local key = _CorrectionKey(spellId, cp, correctBaseRounded)
+                if not _correctionSeenThisSession[key] then
+                    correctMode = true
+                    if correctBaseKind == "corr" then
+                        _DebugCorrection(string.format("start CORR check id=%d cp=%d corr=%d", spellId, cp, correctBaseRounded))
+                    elseif correctBaseKind == "dbc" then
+                        _DebugCorrection(string.format("start DBC check id=%d cp=%d base=%d", spellId, cp, correctBaseRounded))
+                    else
+                        _DebugCorrection(string.format("start learned recheck id=%d cp=%d stored=%d", spellId, cp, correctBaseRounded))
+                    end
+                end
+            else
+                correctBaseKind = nil
+                correctBaseRounded = nil
+            end
+        end
+    end
 
     _DebugSpell(spellId, cp, "CAST")
 
@@ -1396,6 +2167,11 @@ function DoiteTrack:_OnSpellCastEvent()
         complete   = false,
         source     = "cast",
         willRecord = willRecord,
+        correctMode        = correctMode,
+        correctBaseKind    = correctBaseKind,
+        correctBaseRounded = correctBaseRounded,
+        correctDisplayName = entry.name,
+        applyConfirmed     = (not correctMode),
     }
 
     ActiveSessions[s.id] = s
@@ -1474,8 +2250,15 @@ function DoiteTrack:_OnUnitCastEvent()
         return
     end
 
-    if not targetGuid or targetGuid == "" or targetGuid == "0x000000000" or targetGuid == "0x0000000000000000" then
+    -- self-only tracked auras must always bind to player GUID.
+    if entry.trackSelf and (not entry.trackHelp) and (not entry.trackHarm) then
         targetGuid = pGuid
+    elseif not targetGuid or targetGuid == "" or targetGuid == "0x000000000" or targetGuid == "0x0000000000000000" then
+        if entry.trackSelf then
+            targetGuid = pGuid
+        else
+            return
+        end
     end
 
     local cp = 0
@@ -1483,7 +2266,63 @@ function DoiteTrack:_OnUnitCastEvent()
         cp = _GetComboPointsSafe()
     end
 
-    local willRecord = _ShouldRecord(spellId, cp)
+   local willRecord = _ShouldRecord(spellId, cp)
+
+    -- correction-mode (recheck baseline once per armed window)
+    local correctMode = false
+    local correctBaseKind = nil
+    local correctBaseRounded = nil
+
+    if (not willRecord) then
+        if entry.onlyMine and (entry.trackHelp or entry.trackHarm) and (not (entry.trackSelf and (not entry.trackHelp) and (not entry.trackHarm))) then
+            -- Order:
+            -- a) correction recording (stored override)
+            -- b) DBC
+            -- c) learned (tracked)
+            local corr = nil
+            if cp and cp > 0 then
+                corr = _GetCorrectedCPDuration(spellId, cp)
+            else
+                corr = _GetCorrectedFlatDuration(spellId)
+            end
+
+            if corr and corr > 0 then
+                correctBaseKind = "corr"
+                correctBaseRounded = math.floor(corr + 0.5)
+            else
+                local baseDBC = _GetDBCBaseDuration(spellId, cp)
+                if baseDBC and baseDBC > 0 then
+                    correctBaseKind = "dbc"
+                    correctBaseRounded = math.floor(baseDBC + 0.5)
+                else
+                    local stored = nil
+                    if cp > 0 then stored = _GetTrackedCPDuration(spellId, cp) end
+                    if not stored then stored = _GetTrackedFlatDuration(spellId) end
+                    if stored and stored > 0 then
+                        correctBaseKind = "tracked"
+                        correctBaseRounded = math.floor(stored + 0.5)
+                    end
+                end
+            end
+
+            if correctBaseRounded and correctBaseRounded > 0 and correctBaseRounded < 600 then
+                local key = _CorrectionKey(spellId, cp, correctBaseRounded)
+                if not _correctionSeenThisSession[key] then
+                    correctMode = true
+                    if correctBaseKind == "corr" then
+                        _DebugCorrection(string.format("start CORR check id=%d cp=%d corr=%d", spellId, cp, correctBaseRounded))
+                    elseif correctBaseKind == "dbc" then
+                        _DebugCorrection(string.format("start DBC check id=%d cp=%d base=%d", spellId, cp, correctBaseRounded))
+                    else
+                        _DebugCorrection(string.format("start learned recheck id=%d cp=%d stored=%d", spellId, cp, correctBaseRounded))
+                    end
+                end
+            else
+                correctBaseKind = nil
+                correctBaseRounded = nil
+            end
+        end
+    end
 
     _DebugSpell(spellId, cp, "UNIT_CAST")
 
@@ -1517,6 +2356,11 @@ function DoiteTrack:_OnUnitCastEvent()
         complete   = false,
         source     = "cast",
         willRecord = willRecord,
+        correctMode        = correctMode,
+        correctBaseKind    = correctBaseKind,
+        correctBaseRounded = correctBaseRounded,
+        correctDisplayName = entry.name,
+        applyConfirmed     = (not correctMode),
     }
 
     ActiveSessions[s.id] = s
@@ -1598,25 +2442,66 @@ function DoiteTrack:_OnSpellDamageSelf()
     _EnsureOnUpdateEnabled()
 end
 
+function DoiteTrack:_OnAuraCastOnEvent()
+    local spellId    = arg1
+    local casterGuid = arg2
+    local targetGuid = arg3
+
+    if not spellId or spellId == 0 then
+        return
+    end
+
+    local pGuid = _GetPlayerGUID()
+    if not pGuid or not casterGuid or casterGuid == "" or casterGuid ~= pGuid then
+        return
+    end
+
+    if not targetGuid or targetGuid == "" or targetGuid == "0x000000000" or targetGuid == "0x0000000000000000" then
+        targetGuid = pGuid
+    end
+
+    local _, s = _FindSessionFor(spellId, targetGuid)
+    if not s or s.aborted or s.complete then
+        return
+    end
+
+    -- Only correction sessions require "player-applied" confirmation to start timing.
+    if not s.correctMode then
+        return
+    end
+
+    local now = GetTime()
+    s.applyConfirmed = true
+    s.appliedAt = now
+    s.lastSeen  = now
+
+    _RecordAuraForSession(s)
+end
+
 ---------------------------------------------------------------
 -- PLAYER_LOGIN / PLAYER_ENTERING_WORLD / PLAYER_TARGET_CHANGED
 ---------------------------------------------------------------
-function DoiteTrack:_OnPlayerLogin()
-    _playerGUID_cached = nil
-    _GetPlayerGUID()
-    self:RebuildWatchList()
-end
 
 function DoiteTrack:_OnTargetChanged()
     -- reserved for future safeguards
+end
+
+function DoiteTrack:_OnUnitInventoryChanged()
+    -- only care about player
+    if arg1 and arg1 ~= "player" then return end
+    self:_OnProfileMaybeChanged("gear_change")
 end
 
 TrackFrame:RegisterEvent("PLAYER_LOGIN")
 TrackFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 TrackFrame:RegisterEvent("SPELL_CAST_EVENT")
 TrackFrame:RegisterEvent("SPELL_DAMAGE_EVENT_SELF")
+TrackFrame:RegisterEvent("AURA_CAST_ON_SELF")
+TrackFrame:RegisterEvent("AURA_CAST_ON_OTHER")
 TrackFrame:RegisterEvent("PLAYER_TARGET_CHANGED")
 TrackFrame:RegisterEvent("UNIT_CASTEVENT")
+TrackFrame:RegisterEvent("UNIT_INVENTORY_CHANGED")
+TrackFrame:RegisterEvent("LEARNED_SPELL_IN_TAB")
 
 TrackFrame:SetScript("OnEvent", function()
     if event == "PLAYER_LOGIN" or event == "PLAYER_ENTERING_WORLD" then
@@ -1625,8 +2510,14 @@ TrackFrame:SetScript("OnEvent", function()
         DoiteTrack:_OnSpellCastEvent()
     elseif event == "SPELL_DAMAGE_EVENT_SELF" then
         DoiteTrack:_OnSpellDamageSelf()
+    elseif event == "AURA_CAST_ON_SELF" or event == "AURA_CAST_ON_OTHER" then
+        DoiteTrack:_OnAuraCastOnEvent()
     elseif event == "PLAYER_TARGET_CHANGED" then
         DoiteTrack:_OnTargetChanged()
+	elseif event == "UNIT_INVENTORY_CHANGED" then
+        DoiteTrack:_OnUnitInventoryChanged()
+    elseif event == "LEARNED_SPELL_IN_TAB" then
+        _ScheduleProfileRescan(event)
     elseif event == "UNIT_CASTEVENT" then
         DoiteTrack:_OnUnitCastEvent()
     end
@@ -1861,7 +2752,7 @@ function DoiteTrack:HasAnyAuraByName(spellName, unit)
     end
     entry.spellIds = entry.spellIds or {}
 
-    if not UnitExists or not UnitExists(unit) then
+    if not _UnitExistsFlag(unit) then
         return false, nil
     end
 
@@ -1901,13 +2792,30 @@ function DoiteTrack:GetAuraOwnershipByName(spellName, unit)
     end
 
     -- Cheap existence guard
-    if not UnitExists or not UnitExists(unit) then
+    if not _UnitExistsFlag(unit) then
         return nil, false, nil, false, false, false
     end
 
-    -- Ensure spellIds for whatever rank is actually on the unit right now
+    -- Ensure spellIds for whatever rank is actually on the unit right now. Only do the slow spellId discovery if none of our known ids are present.
     entry.spellIds = entry.spellIds or {}
-    _CacheMatchingAuraIdsOnUnit(entry, unit)
+
+    local isDebuff = (entry.kind == "Debuff")
+    local anyPresent = false
+
+    local sid
+    for sid in pairs(entry.spellIds) do
+        if _AuraHasSpellId(unit, sid, isDebuff) then
+            anyPresent = true
+            break
+        end
+    end
+
+    if not anyPresent then
+        local discovered = _CacheMatchingAuraIdsOnUnit(entry, unit)
+        if not discovered or discovered <= 0 then
+            return nil, false, nil, false, false, false
+        end
+    end
 
     local bestRem, bestSpellId = nil, nil
     local recording            = false
@@ -1917,8 +2825,8 @@ function DoiteTrack:GetAuraOwnershipByName(spellName, unit)
     -- Walk ALL spellIds for this name and inspect ownership per-id
     for sid in pairs(entry.spellIds) do
         -- Is this aura (this spellId) actually present on the unit?
-        if _AuraHasSpellId(unit, sid, entry.kind == "Debuff") then
-            local mineSid = self:IsAuraMine(sid, unit)
+        if _AuraHasSpellId(unit, sid, isDebuff) then
+            local mineSid = self:IsAuraMine(sid, unit, true, isDebuff)
 
             if mineSid then
                 hasMine = true
@@ -1974,13 +2882,12 @@ end
 -- Is the tracked aura on this unit ours (player-cast)? "Mine" == either:
 --   * have an active recording session for this spell/unit, OR
 --   * have a positive remaining time from our recorded/DBC duration.
-function DoiteTrack:IsAuraMine(spellId, unit)
+function DoiteTrack:IsAuraMine(spellId, unit, presentOverride, isDebuffOverride)
     if not spellId or not unit then
         return false
     end
 
-    -- If there is an active session for this spell/unit, it is *probably* ours,
-    -- but only for roughly its expected duration.
+    -- If there is an active session for this spell/unit, it is *probably* ours, but only for roughly its expected duration.
     local s = _GetActiveSessionForUnit(spellId, unit)
     if s then
         local base = _GetBaselineDuration(spellId, s.cp or 0)
@@ -1988,37 +2895,37 @@ function DoiteTrack:IsAuraMine(spellId, unit)
             local now     = GetTime()
             local elapsed = now - s.appliedAt
 
-            -- After ~130% of the expected duration, assume the aura on the target
-            -- (if any) now belongs to someone else.
             if elapsed > (base * 1.3) then
                 _AbortSession(s, "elapsed beyond baseline; assume other owner")
             else
                 return true
             end
         else
-            -- No baseline known (no DBC/learned duration): keep old behavior
             return true
         end
     end
 
-    -- Fallback: only trust our bucket if this spellId is actually present right now.
-    local entry = TrackedBySpellId[spellId]
     local present = false
 
-    if entry then
-        present = _AuraHasSpellId(unit, spellId, entry.kind == "Debuff")
+    if presentOverride == true then
+        present = true
     else
-        -- If not know buff/debuff kind, try both.
-        present = _AuraHasSpellId(unit, spellId, true) or _AuraHasSpellId(unit, spellId, false)
-    end
-
-    if not present then
-        -- Stale bucket entry; drop it so it doesn't claim ownership.
-        local guid = _GetUnitGuidSafe(unit)
-        if guid and AuraStateByGuid[guid] then
-            AuraStateByGuid[guid][spellId] = nil
+        local entry = TrackedBySpellId[spellId]
+        if isDebuffOverride ~= nil then
+            present = _AuraHasSpellId(unit, spellId, isDebuffOverride)
+        elseif entry then
+            present = _AuraHasSpellId(unit, spellId, entry.kind == "Debuff")
+        else
+            present = _AuraHasSpellId(unit, spellId, true) or _AuraHasSpellId(unit, spellId, false)
         end
-        return false
+
+        if not present then
+            local guid = _GetUnitGuidSafe(unit)
+            if guid and AuraStateByGuid[guid] then
+                AuraStateByGuid[guid][spellId] = nil
+            end
+            return false
+        end
     end
 
     local rem = self:GetAuraRemainingSeconds(spellId, unit)
@@ -2028,6 +2935,9 @@ end
 --------------------
 -- Ingame selftest
 --------------------
+-- /run DoiteTrack_SetCorrectionDebug(true)
+-- /run DoiteTrack_SetSpellDebug(true)
+
 -- Owner: /run d=DoiteTrack;n="Rend";u="target";rem,rec,sid,hm,ho,ok=d:GetAuraOwnershipByName(n,u);print("has",ok,"sid",sid,"mine",hm,"other",ho,"rem",rem,"rec",rec)
 -- DurationIndex: /run id=123;idx=GetSpellRecField(id,"durationIndex");d=DoiteTrack:GetBaselineDuration(id,0);print("id",id,"idx",idx,"sec",d)
 -- /run local id=11574 local d=DoiteTrack local r=d:GetAuraRemainingSeconds(id,"target") local c=d:IsAuraRecording(id,"target") local m=d:IsAuraMine(id,"target") local b=d:GetBaselineDuration(id,0) print("r",r,"c",c,"m",m,"b",b)

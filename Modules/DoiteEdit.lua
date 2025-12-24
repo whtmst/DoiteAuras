@@ -1,6 +1,7 @@
 ---------------------------------------------------------------
 -- DoiteEdit.lua
 -- Secondary frame for editing Aura conditions / edit UI
+-- Please respect license note: Ask permission
 -- WoW 1.12 | Lua 5.0
 ---------------------------------------------------------------
 

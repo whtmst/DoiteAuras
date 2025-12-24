@@ -1,6 +1,7 @@
 ---------------------------------------------------------------
 -- DoiteLogic.lua
 -- Generic boolean combinator for "in-edit" ability/auras condition
+-- Please respect license note: Ask permission
 -- WoW 1.12 | Lua 5.0
 ---------------------------------------------------------------
 
@@ -184,9 +185,25 @@ local _precedence = {
     OR  = 1,
 }
 
-local function _ToRpn(tokens)
-    local output = {}
-    local stack  = {}
+-- Scratch tables to eliminate per-evaluation allocations (tokens/RPN/stacks)
+local _DA_TMP_RPN_OUT   = {}
+local _DA_TMP_OP_STACK  = {}
+local _DA_TMP_EVAL_STACK = {}
+
+local function _DA_WipeArray(t)
+    local i = _len(t)
+    while i > 0 do
+        t[i] = nil
+        i = i - 1
+    end
+end
+
+local function _ToRpn(tokens, output, stack)
+    output = output or _DA_TMP_RPN_OUT
+    stack  = stack  or _DA_TMP_OP_STACK
+
+    _DA_WipeArray(output)
+    _DA_WipeArray(stack)
 
     local n = _len(tokens)
     local i = 1
@@ -257,8 +274,10 @@ end
 ---------------------------------------------------------------
 -- RPN evaluation
 ---------------------------------------------------------------
-local function _EvalRpn(rpn)
-    local st = {}
+local function _EvalRpn(rpn, st)
+    st = st or _DA_TMP_EVAL_STACK
+    _DA_WipeArray(st)
+
     local n = _len(rpn)
     local i = 1
 
@@ -337,7 +356,14 @@ function DoiteLogic.EvaluateGeneric(list, evalFunc)
         return true
     end
 
-    local tokens = {}
+    -- Reuse a scratch token buffer to avoid per-call allocations
+    local tokens = _DA_TMP_TOKENS
+    if not tokens then
+        -- Backward-compatible: define on first use if not present in this file yet
+        _DA_TMP_TOKENS = {}
+        tokens = _DA_TMP_TOKENS
+    end
+    _DA_WipeArray(tokens)
 
     local i = 1
     while i <= n do
@@ -361,7 +387,8 @@ function DoiteLogic.EvaluateGeneric(list, evalFunc)
 
         i = i + 1
     end
-    local ok, rpn = pcall(_ToRpn, tokens)
+
+    local ok, rpn = pcall(_ToRpn, tokens, _DA_TMP_RPN_OUT, _DA_TMP_OP_STACK)
     if not ok or not rpn then
         local j = 1
         while j <= n do
@@ -373,7 +400,7 @@ function DoiteLogic.EvaluateGeneric(list, evalFunc)
         return true
     end
 
-    local ok2, res = pcall(_EvalRpn, rpn)
+    local ok2, res = pcall(_EvalRpn, rpn, _DA_TMP_EVAL_STACK)
     if not ok2 then
         local j = 1
         while j <= n do

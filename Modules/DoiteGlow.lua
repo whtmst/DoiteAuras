@@ -1,6 +1,7 @@
 ---------------------------------------------------------------
 -- DoiteGlow.lua
 -- Simple compatible glow effect inspired by ActionButtonUtils
+-- Please respect license note: Ask permission
 -- WoW 1.12 | Lua 5.0
 ---------------------------------------------------------------
 

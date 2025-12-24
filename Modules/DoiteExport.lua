@@ -1,6 +1,7 @@
 ---------------------------------------------------------------
 -- DoiteExport.lua
 -- Import/Export UI for DoiteAuras
+-- Please respect license note: Ask permission
 -- WoW 1.12 | Lua 5.0
 ---------------------------------------------------------------
 
