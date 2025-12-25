@@ -30,6 +30,13 @@ _Timestamps are available in the description._
 - Use the **minimap icon** <img width="32" height="32" alt="doiteauras-icon" src="https://github.com/user-attachments/assets/908afec6-0de1-4a4a-8081-198cac49e937" />
 - `/da` or `/doite` or `/doiteauras`
 
+## Shared exported builds
+- Warrior: LINK
+- Druid: [coming soon]: LINK
+- Kara40 Boss Debuffs: LINK
+_To import - copy the text, press the import button inside DoiteAuras in-game and paste._
+<iframe src="https://pastebin.com/embed_iframe/kh9b4Vex" style="border:none;width:100%"></iframe>
+
 ## Installation
 1.  Navigate to your World of Warcraft installation folder.
 2.  Go into the `Interface` -> `AddOns` directory.
