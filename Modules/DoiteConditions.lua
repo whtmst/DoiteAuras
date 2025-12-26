@@ -6140,9 +6140,9 @@ local function DoiteConditions_OnUpdate(dt)
     if _acc < thresh then return end
     _acc = 0
 
-    local needAbilityLogic = dirty_ability or dirty_power
-    local needAbilityTime  = dirty_ability_time
-    local needAura         = dirty_aura or dirty_target
+	local needAbilityLogic = dirty_ability or dirty_power
+	local needAbilityTime  = dirty_ability_time
+	local needAura         = dirty_aura or dirty_target or dirty_power
 
     if needAbilityLogic or needAbilityTime then
         _G.DoiteConditions:EvaluateAbilities(needAbilityLogic, needAbilityTime)
