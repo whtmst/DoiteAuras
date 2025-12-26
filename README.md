@@ -32,7 +32,7 @@ _Timestamps are available in the description._
 
 ## Shared exported builds
 - Warrior: [**LINK**](https://pastebin.com/kh9b4Vex)
-- Druid: [coming soon]: [**LINK**](https://pastebin.com/uJtpumYd)
+- Druid: [all forms]: [**LINK**](https://pastebin.com/uJtpumYd)
 - Kara40 Boss Debuffs: [**LINK**](https://pastebin.com/mf7KVYTX)
 - Melee consumes: [**LINK**](https://pastebin.com/kknCLm6A)
 
