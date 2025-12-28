@@ -946,7 +946,7 @@ local AuraStateByGuid = {}
 --  Cannot see a "refresh event", so infer:
 --    1) Player cast Ferocious Bite (by name)
 --    2) Within 0.5s, player gains a combo point (0->1 etc)
---    3) If yes, refresh our stored timers for Rip/Rake on that target
+--    3) If yes, refresh stored timers for Rip/Rake on that target
 ---------------------------------------------------------------
 
 local _SC_Druid = false
@@ -2123,7 +2123,7 @@ local function _AuraHasSpellId(unit, spellId, isDebuff)
         _G["DoiteTrack_AuraHasCache"] = cache
     end
 
-    -- Use the same tick/gen cadence as the aura-field cache if present, otherwise maintain our own tick/gen.
+    -- Use the same tick/gen cadence as the aura-field cache if present, otherwise maintain own tick/gen.
     local gen = nil
     local fieldCache = _G["DoiteTrack_AuraFieldCache"]
     if fieldCache and fieldCache._gen then
@@ -2615,17 +2615,38 @@ local function _EnsureOnUpdateEnabled()
                                                 _DebugCorrection("cancel: aura faded while not targeted ("..tostring(s.spellId)..")")
                                             end
                                         else
-                                            local dur = lastSeen - s.appliedAt
-                                            if dur > 0.5 and dur < 600 then
-                                                _FinishSession(s, dur)
-                                                if s.willRecord then
-                                                    _NotifyTrackingFinished(s.spellId, s.spellName, s.spellRank, s.cp, dur)
+                                            -- Swiftmend consume safety net:
+                                            -- If this is Rejuv/Regrowth recording and Swiftmend just happened on this target, abort instead of finishing (prevents committing partial durations).
+                                            if s._SMGuard and (s.willRecord or s.correctMode) then
+                                                local sm = _G["DoiteTrack_SwiftmendRecent"]
+                                                local t  = sm and sm[s.targetGuid]
+                                                if t then
+                                                    local dtSM = now2 - t
+                                                    if dtSM >= 0 and dtSM <= 0.75 then
+                                                        _AbortSession(s, "swiftmend consumed")
+                                                        if s.willRecord then
+                                                            _NotifyTrackingCancelled(s.spellName, "consumed by Swiftmend")
+                                                        elseif s.correctMode then
+                                                            _DebugCorrection("cancel: swiftmend consumed ("..tostring(s.spellId)..")")
+                                                        end
+                                                        sm[s.targetGuid] = nil
+                                                    end
                                                 end
-                                                -- correction-mode prints only if it actually applied an override (inside _FinishSession)
-                                            else
-                                                _AbortSession(s, "duration out of range")
-                                                if s.willRecord then
-                                                    _NotifyTrackingCancelled(s.spellName, "duration out of range")
+                                            end
+
+                                            if not s.aborted then
+                                                local dur = lastSeen - s.appliedAt
+                                                if dur > 0.5 and dur < 600 then
+                                                    _FinishSession(s, dur)
+                                                    if s.willRecord then
+                                                        _NotifyTrackingFinished(s.spellId, s.spellName, s.spellRank, s.cp, dur)
+                                                    end
+                                                    -- correction-mode prints only if it actually applied an override (inside _FinishSession)
+                                                else
+                                                    _AbortSession(s, "duration out of range")
+                                                    if s.willRecord then
+                                                        _NotifyTrackingCancelled(s.spellName, "duration out of range")
+                                                    end
                                                 end
                                             end
                                         end
@@ -2828,6 +2849,14 @@ function DoiteTrack:_OnSpellCastEvent()
     local name, rank     = _GetSpellNameRank(spellId)
     local isPlayerTarget = (targetGuid == pGuid)
 
+    local smGuard = false
+    if entry.onlyMine == true and entry.kind == "Buff" then
+        local nn = _NormSpellName(name)
+        if nn == "rejuvenation" or nn == "regrowth" then
+            smGuard = true
+        end
+    end
+
     local s = {
         id         = SessionCounter,
         spellId    = spellId,
@@ -2850,6 +2879,9 @@ function DoiteTrack:_OnSpellCastEvent()
         correctBaseRounded = correctBaseRounded,
         correctDisplayName = entry.name,
         applyConfirmed     = (not correctMode),
+
+        -- Swiftmend can consume Rejuv/Regrowth -> abort recordings if that happens
+        _SMGuard   = smGuard and true or false,
     }
 
     ActiveSessions[s.id] = s
@@ -2873,6 +2905,69 @@ function DoiteTrack:_OnUnitCastEvent()
 
     if not spellId or spellId == 0 then
         return
+    end
+
+    -- Swiftmend consumption guard (ANY caster):
+    -- If Swiftmend is cast on a target where currently there is an active *recording* session for Rejuvenation/Regrowth, abort it so it never commit a partial duration.
+    do
+        local n = nil
+
+        if GetSpellNameAndRankForId then
+            local ok, nn = pcall(GetSpellNameAndRankForId, spellId)
+            if ok and nn and nn ~= "" then
+                n = nn
+            end
+        end
+
+        if (not n or n == "") and SpellInfo then
+            local nn2 = SpellInfo(spellId)
+            if type(nn2) == "string" and nn2 ~= "" then
+                n = nn2
+            end
+        end
+
+        if n and n ~= "" then
+            local norm = _NormSpellName(n)
+            if norm == "swiftmend" then
+                if targetGuid and targetGuid ~= "" and targetGuid ~= "0x000000000" and targetGuid ~= "0x0000000000000000" then
+                    local nowSM = (GetTime and GetTime() or 0)
+
+                    local sm = _G["DoiteTrack_SwiftmendRecent"]
+                    if not sm then
+                        sm = {}
+                        _G["DoiteTrack_SwiftmendRecent"] = sm
+                    end
+                    sm[targetGuid] = nowSM
+
+                    local toAbort = nil
+                    local id, s
+                    for id, s in pairs(ActiveSessions) do
+                        if s and (not s.aborted) and (not s.complete) and s._SMGuard and s.targetGuid == targetGuid then
+                            if s.willRecord or s.correctMode then
+                                if not toAbort then toAbort = {} end
+                                toAbort[table.getn(toAbort) + 1] = id
+                            end
+                        end
+                    end
+
+                    if toAbort then
+                        local i
+                        for i = 1, table.getn(toAbort) do
+                            local sid = toAbort[i]
+                            local ss = ActiveSessions[sid]
+                            if ss and (not ss.aborted) and (not ss.complete) then
+                                _AbortSession(ss, "swiftmend consumed")
+                                if ss.willRecord then
+                                    _NotifyTrackingCancelled(ss.spellName, "consumed by Swiftmend")
+                                elseif ss.correctMode then
+                                    _DebugCorrection("cancel: swiftmend consumed ("..tostring(ss.spellId)..")")
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
     end
 
     local pGuid = _GetPlayerGUID()
@@ -3033,6 +3128,14 @@ function DoiteTrack:_OnUnitCastEvent()
     local name, rank     = _GetSpellNameRank(spellId)
     local isPlayerTarget = (targetGuid == pGuid)
 
+    local smGuard = false
+    if entry.onlyMine == true and entry.kind == "Buff" then
+        local nn = _NormSpellName(name)
+        if nn == "rejuvenation" or nn == "regrowth" then
+            smGuard = true
+        end
+    end
+
     local s = {
         id         = SessionCounter,
         spellId    = spellId,
@@ -3055,6 +3158,9 @@ function DoiteTrack:_OnUnitCastEvent()
         correctBaseRounded = correctBaseRounded,
         correctDisplayName = entry.name,
         applyConfirmed     = (not correctMode),
+
+        -- Swiftmend can consume Rejuv/Regrowth -> abort recordings if that happens
+        _SMGuard   = smGuard and true or false,
     }
 
     ActiveSessions[s.id] = s
@@ -3526,7 +3632,7 @@ function DoiteTrack:GetAuraOwnershipByName(spellName, unit)
         return nil, false, nil, false, false, false
     end
 
-    -- Ensure spellIds for whatever rank is actually on the unit right now. Only do the slow spellId discovery if none of our known ids are present.
+    -- Ensure spellIds for whatever rank is actually on the unit right now. Only do the slow spellId discovery if none of known ids are present.
     entry.spellIds = entry.spellIds or {}
 
     local isDebuff = (entry.kind == "Debuff")
@@ -3561,7 +3667,7 @@ function DoiteTrack:GetAuraOwnershipByName(spellName, unit)
             if mineSid then
                 hasMine = true
 
-                -- Only ever report remaining time for *our* auras
+                -- Only ever report remaining time for auras
                 local remSid = self:GetAuraRemainingSeconds(sid, unit)
                 if remSid and remSid > 0 then
                     if not bestRem or remSid > bestRem then
@@ -3611,7 +3717,7 @@ end
 
 -- Is the tracked aura on this unit ours (player-cast)? "Mine" == either:
 --   * have an active recording session for this spell/unit, OR
---   * have a positive remaining time from our recorded/DBC duration.
+--   * have a positive remaining time from recorded/DBC duration.
 function DoiteTrack:IsAuraMine(spellId, unit, presentOverride, isDebuffOverride)
     if not spellId or not unit then
         return false
