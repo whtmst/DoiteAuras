@@ -15,13 +15,14 @@ _Please respect the license note._
 
 ## Features
 - Able to track an ability, buff, debuff and/or item
+- Import/export functions to share UI profiles
 - Custom conditions (~50) to align when to show/hide icons
 - Custom "and/or () logic" builder for a more precise conditioning
 - Custom dynamic time-tracking system for auras on the target
 - Custom icon glow visual effect, inspired by later clients
 - Custom animations for "soon of CD" (abilities)
 - Custom dynamic grouping system, collapsing towards a relative point
-- More to come.. _(bars, mouseover support, more features, setting options)_
+- More to come.. _(bars, mouseover support, more features, setting options, skins)_
 
 ## Tutorial & How-to instructions
 [![Watch the video](https://img.youtube.com/vi/L049puyYDV8/maxresdefault.jpg)](https://youtu.be/L049puyYDV8)
