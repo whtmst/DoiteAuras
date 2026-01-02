@@ -1589,13 +1589,18 @@ end
 local _NotifyCorrectionApplied
 local _NotifyCorrectionCleared
 
-local function _AbortSession(session, reason)
+local function _AbortSession(session, reason, keepAura)
   if not session or session.aborted or session.complete then
     return
   end
   session.aborted = true
   session.abortReason = reason or "unknown"
-  _ClearAuraForSession(session)
+
+  -- Default behavior: clear runtime aura bucket for this session.
+  -- Exception: refresh-before-fade should NOT clear until a new apply is actually confirmed (resist etc).
+  if not keepAura then
+    _ClearAuraForSession(session)
+  end
 
   -- do not keep dead sessions around
   if session.id then
@@ -3044,7 +3049,8 @@ function DoiteTrack:_OnSpellCastEvent()
 
   local sid, existing = _FindSessionFor(spellId, targetGuid)
   if existing then
-    _AbortSession(existing, "refreshed before fade")
+    -- Do NOT clear runtime aura state on a refresh attempt; the new cast might be resisted.
+    _AbortSession(existing, "refreshed before fade", true)
     if existing.willRecord then
       _NotifyTrackingCancelled(existing.spellName, "refreshed before fade; starting new recording")
     end
@@ -3408,7 +3414,8 @@ function DoiteTrack:_OnUnitCastEvent()
 
   local sid, existing = _FindSessionFor(spellId, targetGuid)
   if existing then
-    _AbortSession(existing, "refreshed before fade")
+    -- Do NOT clear runtime aura state on a refresh attempt; the new cast might be resisted.
+    _AbortSession(existing, "refreshed before fade", true)
     if existing.willRecord then
       _NotifyTrackingCancelled(existing.spellName, "refreshed before fade; starting new recording")
     end
