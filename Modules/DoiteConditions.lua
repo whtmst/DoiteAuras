@@ -2105,21 +2105,9 @@ local function _PlayerAuraRemainingSeconds(auraName)
     return nil
   end
 
-  -- Try to get buff info first
-  local buffSlot, buffInfo = DoitePlayerAuras.GetBuffInfo(auraName)
-  if buffSlot and buffInfo then
-    local idx = GetPlayerBuff(buffSlot - 1, "HELPFUL") -- correct for 1 index
-    local remaining = GetPlayerBuffTimeLeft(idx)
-    if remaining and remaining > 0 then
-      return remaining
-    end
-  end
-
-  -- Try debuff if buff not found
-  local debuffSlot, debuffInfo = DoitePlayerAuras.GetDebuffInfo(auraName)
-  if debuffSlot and debuffInfo then
-    local idx = GetPlayerBuff(debuffSlot - 1, "HARMFUL") -- correct for 1 index
-    local remaining = GetPlayerBuffTimeLeft(idx)
+  local playerBuffBarSlot = DoitePlayerAuras.GetBuffBarSlot(auraName)
+  if playerBuffBarSlot then
+    local remaining = GetPlayerBuffTimeLeft(playerBuffBarSlot)
     if remaining and remaining > 0 then
       return remaining
     end
@@ -2506,11 +2494,12 @@ local function _GetAuraStacksOnUnit(unit, auraName, wantDebuff)
     return nil
   end
 
+  -- TODO improve logic for other units
   ----------------------------------------------------------------
   -- Primary scan: normal BUFF / DEBUFF list for non-player units
   ----------------------------------------------------------------
   local i = 1
-  while i <= 40 do
+  while i <= 32 do
     local tex, applications, auraId
     if wantDebuff then
       -- texture, stacks, dtype, spellID
@@ -2546,7 +2535,7 @@ local function _GetAuraStacksOnUnit(unit, auraName, wantDebuff)
       if debCount >= 16 and buffs and buffs[auraName] then
         -- First try a SpellInfo-based pass (mirrors main loop)
         local j = 1
-        while j <= 40 do
+        while j <= 32 do
           local tex2, applications2, auraId2 = UnitBuff(unit, j)
           if not tex2 then
             break
@@ -2566,7 +2555,7 @@ local function _GetAuraStacksOnUnit(unit, auraName, wantDebuff)
 
         -- Fallback: tooltip-based name resolution via _GetAuraName, then a second UnitBuff call to read stacks.
         j = 1
-        while j <= 40 do
+        while j <= 32 do
           local n = _GetAuraName(unit, j, false)
           if n == nil then
             break
@@ -3334,9 +3323,9 @@ local function _FmtRem(remSec)
     return nil
   end
   if remSec >= 3600 then
-    return math.floor(remSec / 3600) .. "+h"
+    return math.floor((remSec / 3600) * 2 + 0.5) / 2 .. "h" -- round to nearest 0.5 hour
   elseif remSec >= 60 then
-    return math.floor(remSec / 60) .. "+m"
+    return math.floor((remSec / 60) * 2 + 0.5) / 2 .. "m" -- round to nearest 0.5 min
   elseif remSec < 1.6 then
     -- only show tenths when under 1.6s left
     -- Stabilize tenths by truncating, not rounding up (matches old behavior)
@@ -5367,6 +5356,8 @@ local function _Doite_UpdateOverlayForFrame(frame, key, dataTbl, slideActive)
     frame._daLastTextSize = w
     local remSize = math.max(10, math.floor(w * 0.42))
     local stackSize = math.max(8, math.floor(w * 0.28))
+    frame._daRemSize = remSize
+    frame._daStackSize = stackSize
     frame._daTextRem:SetFont(GameFontHighlight:GetFont(), remSize, "OUTLINE")
     frame._daTextStacks:SetFont(GameFontNormalSmall:GetFont(), stackSize, "OUTLINE")
   end
@@ -5544,8 +5535,8 @@ local function _Doite_UpdateOverlayForFrame(frame, key, dataTbl, slideActive)
     if remText ~= frame._daLastRemText then
       frame._daLastRemText = remText
       frame._daTextRem:SetText(remText)
+      frame._daTextRem:SetTextColor(1, 1, 1, 1)
     end
-    frame._daTextRem:SetTextColor(1, 1, 1, 1)
     frame._daTextRem:Show()
   end
 
@@ -5594,8 +5585,14 @@ local function _Doite_UpdateOverlayForFrame(frame, key, dataTbl, slideActive)
           if s ~= frame._daLastStacksText then
             frame._daLastStacksText = s
             frame._daTextStacks:SetText(s)
+            frame._daTextStacks:SetTextColor(1, 1, 1, 1)
           end
-          frame._daTextStacks:SetTextColor(1, 0.2, 0.2, 1)
+          -- Use larger size if showing stacks but not rem
+          local sizeToUse = (not wantRem and frame._daRemSize) or frame._daStackSize
+          if sizeToUse and sizeToUse ~= frame._daCurrentStackFontSize then
+            frame._daCurrentStackFontSize = sizeToUse
+            frame._daTextStacks:SetFont(GameFontNormalSmall:GetFont(), sizeToUse, "OUTLINE")
+          end
           frame._daTextStacks:Show()
         end
       end
@@ -5621,8 +5618,14 @@ local function _Doite_UpdateOverlayForFrame(frame, key, dataTbl, slideActive)
         if s ~= frame._daLastStacksText then
           frame._daLastStacksText = s
           frame._daTextStacks:SetText(s)
+          frame._daTextStacks:SetTextColor(1, 1, 1, 1)
         end
-        frame._daTextStacks:SetTextColor(1, 0.2, 0.2, 1)
+        -- Use larger size if showing stacks but not rem
+        local sizeToUse = (not wantRem and frame._daRemSize) or frame._daStackSize
+        if sizeToUse and sizeToUse ~= frame._daCurrentStackFontSize then
+          frame._daCurrentStackFontSize = sizeToUse
+          frame._daTextStacks:SetFont(GameFontNormalSmall:GetFont(), sizeToUse, "OUTLINE")
+        end
         frame._daTextStacks:Show()
       end
     end

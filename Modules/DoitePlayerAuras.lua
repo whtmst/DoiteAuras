@@ -6,7 +6,9 @@ local DoitePlayerAuras = {
   spellNameToIdCache = {},
 
   activeBuffs = {},
-  activeDebuffs = {}
+  activeDebuffs = {},
+
+  playerBuffIndexCache = {}
 }
 -- initialize all buff/debuff indexes
 for i = 1, 32 do
@@ -35,7 +37,7 @@ PlayerAurasFrame:RegisterEvent("DEBUFF_REMOVED_SELF")
 local function MarkActive(spellId, activeTable, slot)
   -- cache spell name if not already cached
   if not DoitePlayerAuras.spellIdToNameCache[spellId] then
-    local spellName = GetSpellNameAndRankForId(spellId)
+    local spellName = GetSpellRecField(spellId, "name")
     if spellName then
       DoitePlayerAuras.spellIdToNameCache[spellId] = spellName
       DoitePlayerAuras.spellNameToIdCache[spellName] = spellId
@@ -174,26 +176,61 @@ function DoitePlayerAuras.GetDebuffInfo(spellName)
   return nil, nil
 end
 
+-- returns the player buff index (buffs and debuffs are mixed together) for use with GetPlayerBuffX functions
+function DoitePlayerAuras.GetBuffBarSlot(spellName)
+  -- convert spellName to spellId using cache
+  local spellId = DoitePlayerAuras.spellNameToIdCache[spellName]
+  if not spellId then
+    return nil
+  end
+
+  -- check cached index first
+  local cachedIndex = DoitePlayerAuras.playerBuffIndexCache[spellName]
+  if cachedIndex then
+    local buffSpellId = GetPlayerBuffID(cachedIndex) -- superwow function that returns spellId at player buff index
+    if buffSpellId == spellId then
+      return cachedIndex
+    end
+  end
+
+  -- loop through 0-47 to find the buff/debuff index
+  for i = 0, 47 do
+    local buffSpellId = GetPlayerBuffID(i)
+
+    if not buffSpellId then
+      break
+    end
+
+    if buffSpellId == spellId then
+      -- cache the index
+      DoitePlayerAuras.playerBuffIndexCache[spellName] = i
+      return i
+    end
+  end
+
+  return nil
+end
+
 PlayerAurasFrame:SetScript("OnEvent", function()
   if event == "PLAYER_ENTERING_WORLD" then
     UpdateBuffs()
     UpdateDebuffs()
   else
     -- BUFF_ADDED_SELF, BUFF_REMOVED_SELF, DEBUFF_ADDED_SELF, DEBUFF_REMOVED_SELF
-    -- event slot is 1 indexed, need to convert to zero index for use with GetPlayerBuff functions
-    local guid, slot, spellId, stacks = arg1, arg2, arg3, arg4
+    -- unitSlot is the 1 indexed slot with empty slots removed for use with UnitBuff/UnitDebuff
+    local guid, unitSlot, spellId, stacks = arg1, arg2, arg3, arg4
     if event == "BUFF_ADDED_SELF" then
-      DoitePlayerAuras.buffs[slot].spellId = spellId
-      DoitePlayerAuras.buffs[slot].stacks = stacks
-      MarkActive(spellId, DoitePlayerAuras.activeBuffs, slot)
+      DoitePlayerAuras.buffs[unitSlot].spellId = spellId
+      DoitePlayerAuras.buffs[unitSlot].stacks = stacks
+      MarkActive(spellId, DoitePlayerAuras.activeBuffs, unitSlot)
     elseif event == "BUFF_REMOVED_SELF" then
       -- probably could just shift down buffs a slot but not sure what happens when 2 get removed at the exact same time
       UpdateBuffs()
       MarkInactive(spellId, DoitePlayerAuras.activeBuffs)
     elseif event == "DEBUFF_ADDED_SELF" then
-      DoitePlayerAuras.debuffs[slot].spellId = spellId
-      DoitePlayerAuras.debuffs[slot].stacks = stacks
-      MarkActive(spellId, DoitePlayerAuras.activeDebuffs, slot)
+      DoitePlayerAuras.debuffs[unitSlot].spellId = spellId
+      DoitePlayerAuras.debuffs[unitSlot].stacks = stacks
+      MarkActive(spellId, DoitePlayerAuras.activeDebuffs, unitSlot)
     elseif event == "DEBUFF_REMOVED_SELF" then
       -- probably could just shift down buffs a slot but not sure what happens when 2 get removed at the exact same time
       UpdateDebuffs()
