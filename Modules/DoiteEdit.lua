@@ -37,9 +37,9 @@ local function _IsRogueOrDruid()
 end
 
 ----------------------------------------------------------------
--- Nampower version guard (needed for Aura owner tracking) Requires Nampower 2.15.1+
+-- Nampower version guard (needed for Aura owner tracking) Requires Nampower 2.24.0
 ----------------------------------------------------------------
-local _NP_REQ_MAJOR, _NP_REQ_MINOR, _NP_REQ_PATCH = 2, 15, 1
+local _NP_REQ_MAJOR, _NP_REQ_MINOR, _NP_REQ_PATCH = 2, 24, 0
 
 local function _NP_GetVersion()
   if type(GetNampowerVersion) == "function" then
@@ -2581,12 +2581,12 @@ local function CreateConditionsUI()
     end
   end
 
-  function UpdateItemStacksForMissing()
+function UpdateItemStacksForMissing()
     if not condFrame or not condFrame.cond_item_where_missing then
       return
     end
 
-    local ms = condFrame.cond_item_where_missing:GetChecked()
+    local ms = condFrame.cond_item_where_missing:GetChecked() and true or false
 
     local function _setCheckState(cb, enabled, clearWhenDisabling)
       if not cb then
@@ -2608,7 +2608,23 @@ local function CreateConditionsUI()
       end
     end
 
-    -- keep DB in sync with programmatic UI changes
+    -- If item is marked Missing: stacks condition + "Icon text: Stacks" do not apply. Disable them and clear their checks immediately.
+    _setCheckState(condFrame.cond_item_stacks_cb, (not ms), true)
+    _setCheckState(condFrame.cond_item_text_stack, (not ms), true)
+
+    if ms then
+      if condFrame.cond_item_stacks_comp then
+        condFrame.cond_item_stacks_comp:Hide()
+      end
+      if condFrame.cond_item_stacks_val then
+        condFrame.cond_item_stacks_val:Hide()
+      end
+      if condFrame.cond_item_stacks_val_enter then
+        condFrame.cond_item_stacks_val_enter:Hide()
+      end
+    end
+
+    -- keep DB in sync with programmatic UI changes (after we may have cleared checks)
     if currentKey then
       local d = EnsureDBEntry(currentKey)
       d.conditions = d.conditions or {}
@@ -2619,8 +2635,8 @@ local function CreateConditionsUI()
       local textOn = (condFrame.cond_item_text_stack and condFrame.cond_item_text_stack.GetChecked
           and condFrame.cond_item_text_stack:GetChecked()) and true or false
 
-      d.conditions.item.stacksEnabled = stacksOn or false
-      d.conditions.item.textStackCounter = textOn or false
+      d.conditions.item.stacksEnabled = stacksOn and true or false
+      d.conditions.item.textStackCounter = textOn and true or false
     end
   end
 
@@ -3041,7 +3057,7 @@ local function CreateConditionsUI()
     end
   end
 
-  -- Nampower guard: Aura owner tracking requires Nampower 2.15.1+
+  -- Nampower guard: Aura owner tracking requires Nampower
   local function AuraOwner_ApplyNampowerGuard()
     if not condFrame then
       return
@@ -3059,7 +3075,7 @@ local function CreateConditionsUI()
         condFrame.cond_aura_owner_tip:SetText(condFrame._aura_owner_tip_default)
       else
         condFrame.cond_aura_owner_tip:SetText(
-            "Nampower 2.15.1+ req. for these options. You have " .. tostring(verStr) .. "."
+            "Nampower 2.40.0+ req. for these options. You have " .. tostring(verStr) .. "."
         )
       end
     end
@@ -3715,7 +3731,7 @@ local function CreateConditionsUI()
   local distanceChoices = { "Any", "In range", "Melee range", "Not in range", "Behind", "In front" }
 
   local unitTypeChoices = {
-    "Any", "Players", "NPC",
+    "Any", "Players", "NPC", "Boss",
     "1. Humanoid", "2. Beast", "3. Dragonkin", "4. Undead",
     "5. Demon", "6. Giant", "7. Mechanical", "8. Elemental",
     -- Multi: versions (like forms; add common combos)
@@ -6563,11 +6579,7 @@ local function UpdateConditionsUI(data)
       AuraCond_RefreshFromDB("item")
     end
 
-    local ic = c.item or {}
-
-    if UpdateItemStacksForMissing then
-      UpdateItemStacksForMissing()
-    end
+local ic = c.item or {}
 
     local function _enCheck(cb)
       if not cb then
@@ -6588,12 +6600,28 @@ local function UpdateConditionsUI(data)
       end
     end
 
-    -- WHEREABOUTS / INVENTORY SLOT (special items)
-    local dispName = data.displayName or currentKey or ""
-    local isTrinketSlots = (dispName == "---EQUIPPED TRINKET SLOTS---")
-    local isWeaponSlots = (dispName == "---EQUIPPED WEAPON SLOTS---")
+	-- WHEREABOUTS / INVENTORY SLOT (special items)
+	local dispName = data.displayName or currentKey or ""
+	local isTrinketSlots = (dispName == "---EQUIPPED TRINKET SLOTS---")
+	local isWeaponSlots = (dispName == "---EQUIPPED WEAPON SLOTS---")
 
-    local isMissing = false
+	-- Swap "Quantity" -> "Stacks" only for the synthetic weapon-slot entry (no DB entries)
+	condFrame._item_qty_cb_default = condFrame._item_qty_cb_default or "Quantity"
+	condFrame._item_qty_sep_default = condFrame._item_qty_sep_default or "QUANTITY"
+
+	if isWeaponSlots then
+	  if condFrame.cond_item_stacks_cb and condFrame.cond_item_stacks_cb.text and condFrame.cond_item_stacks_cb.text.SetText then
+		condFrame.cond_item_stacks_cb.text:SetText("Stacks")
+	  end
+	  SetSeparator("item", 8, "TEMPORARY ENCHANTMENT STACKS", true, true)
+	else
+	  if condFrame.cond_item_stacks_cb and condFrame.cond_item_stacks_cb.text and condFrame.cond_item_stacks_cb.text.SetText then
+		condFrame.cond_item_stacks_cb.text:SetText(condFrame._item_qty_cb_default)
+	  end
+	  SetSeparator("item", 8, condFrame._item_qty_sep_default, true, true)
+	end
+
+	local isMissing = false
 
     if isTrinketSlots or isWeaponSlots then
       -- Special synthetic entries: use "INVENTORY SLOT" row, never drive missing-logic
@@ -6805,16 +6833,40 @@ local function UpdateConditionsUI(data)
     condFrame.cond_item_glow:SetChecked(ic.glow == true)
     condFrame.cond_item_greyscale:SetChecked(ic.greyscale == true)
 
-    if mode == "oncd" and not isMissing then
-      _enCheck(condFrame.cond_item_text_time)
-      condFrame.cond_item_text_time:SetChecked(ic.textTimeRemaining == true)
-    else
+    -- Label changes ONLY for equipped weapon slots when mode is "notcd"
+    do
+      local lbl = "Icon text: Remaining"
+      if isWeaponSlots and mode == "notcd" then
+        lbl = "Icon text: Enchant uptime"
+      end
+      if condFrame.cond_item_text_time and condFrame.cond_item_text_time.text
+          and condFrame.cond_item_text_time.text.SetText then
+        condFrame.cond_item_text_time.text:SetText(lbl)
+      end
+    end
+
+    -- Default/original behavior:
+    --  - Non-weapon items: only usable on "oncd"
+    --  - Weapon slots: usable on "oncd" (Remaining) AND on "notcd" (Enchant time)
+    if isMissing then
       if ic.textTimeRemaining then
         ic.textTimeRemaining = false
       end
       condFrame.cond_item_text_time:SetChecked(false)
       _disCheck(condFrame.cond_item_text_time)
+    else
+      if mode == "oncd" or (isWeaponSlots and mode == "notcd") then
+        _enCheck(condFrame.cond_item_text_time)
+        condFrame.cond_item_text_time:SetChecked(ic.textTimeRemaining == true)
+      else
+        if ic.textTimeRemaining then
+          ic.textTimeRemaining = false
+        end
+        condFrame.cond_item_text_time:SetChecked(false)
+        _disCheck(condFrame.cond_item_text_time)
+      end
     end
+
 
     -- ITEM STACKS row (Item stacks + text stack counter)
     do
@@ -7447,7 +7499,7 @@ local function UpdateConditionsUI(data)
       condFrame.cond_aura_hp_val_enter:Hide()
     end
 
-    -- Aura owner flags ("My Aura" / "Others Aura") – buff and debuff identical. IMPORTANT: must respect Nampower guard (2.15.1+), otherwise UpdateConditionsUI will re-enable them.
+    -- Aura owner flags ("My Aura" / "Others Aura") – buff and debuff identical. IMPORTANT: must respect Nampower guard, otherwise UpdateConditionsUI will re-enable them.
     local npOK = (condFrame and condFrame._npAuraOwnerOK == true) and true or false
 
     -- Use the shared helper if available; otherwise fall back to local enable/disable behavior.

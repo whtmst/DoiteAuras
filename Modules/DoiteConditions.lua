@@ -1218,6 +1218,12 @@ local _ItemStateScratch = {
   rem = nil,
   dur = nil,
 
+  -- temp enchant tracking (weapon slots)
+  teRem = nil,       -- seconds remaining (0 if expired)
+  teCharges = nil,   -- charges remaining (0 if none/expired)
+  teItemId = nil,    -- cached itemId of the enchanted weapon
+  teEnchantId = nil, -- cached tempEnchantId
+
   -- stack/amount tracking
   eqCount = 0, -- total amount in equipped gear
   bagCount = 0, -- total amount in bags (0..4)
@@ -1232,6 +1238,12 @@ local function _ResetItemState(state)
   state.modeMatches = true
   state.rem = nil
   state.dur = nil
+
+  -- reset temp enchant
+  state.teRem = nil
+  state.teCharges = nil
+  state.teItemId = nil
+  state.teEnchantId = nil
 
   -- reset counts
   state.eqCount = 0
@@ -1275,6 +1287,143 @@ local function _EvaluateItemCoreState(data, c)
         state.modeMatches = (hasItem and (not onCd))
       else
         state.modeMatches = true
+      end
+
+      ----------------------------------------------------------------
+      -- Temp enchant tracking (Nampower GetEquippedItem) for weapon-slot synthetic entries
+      -- Guarded by displayName == "---EQUIPPED WEAPON SLOTS---"
+      --
+      -- Special cases:
+      --  * mode == "notcd" + textTimeRemaining => show temp enchant remaining time
+      --  * textStackCounter / stacksEnabled    => use temp enchant charges as "count"
+      --
+      -- Cache persists across weapon swaps so countdown continues even
+      -- if the enchanted weapon is not currently equipped in that slot.
+      ----------------------------------------------------------------
+      if (invSlotName == "MAINHAND" or invSlotName == "OFFHAND" or invSlotName == "RANGED")
+          and data.displayName == "---EQUIPPED WEAPON SLOTS---" then
+
+        local needTE = false
+        if (c.textTimeRemaining == true and mode == "notcd")
+            or (c.textStackCounter == true)
+            or (c.stacksEnabled == true) then
+          needTE = true
+        end
+
+        if needTE then
+          local now = GetTime()
+
+          local te = DoiteConditions._daTempEnchantCache
+          if not te then
+            te = {}
+            DoiteConditions._daTempEnchantCache = te
+          end
+
+          local slotC = te[idx]
+          if not slotC then
+            slotC = {}
+            te[idx] = slotC
+          end
+
+          -- Expire cached enchant by time
+          if slotC.endTime and slotC.endTime <= now then
+            slotC.endTime = nil
+            slotC.tempEnchantId = nil
+            slotC.charges = 0
+          end
+
+          -- Rate-limited refresh from current equipped item in this slot
+          -- (UNIT_INVENTORY_CHANGED will also poke this)
+          local lastT = slotC.t or 0
+          if (now - lastT) > 0.15 then
+            slotC.t = now
+
+            if GetEquippedItem then
+              local info = GetEquippedItem("player", idx)
+
+              -- Always track what's currently in the slot so stale itemId doesn't stick.
+              if info and info.itemId then
+                slotC.itemId = info.itemId
+              else
+                slotC.itemId = nil
+              end
+
+              local teId = info and info.tempEnchantId or nil
+              local msLeft = info and info.tempEnchantmentTimeLeftMs or nil
+
+              if info and teId and teId > 0 then
+                -- Optional per-slot memory (handles rare cases where timeLeft isn't returned)
+                local memE = slotC._e
+                if not memE then
+                  memE = {}
+                  slotC._e = memE
+                end
+                local memC = slotC._c
+                if not memC then
+                  memC = {}
+                  slotC._c = memC
+                end
+
+                local key = tostring(slotC.itemId or 0) .. ":" .. tostring(teId)
+
+                slotC.tempEnchantId = teId
+
+                if msLeft and msLeft > 0 then
+                  local endT = now + (msLeft / 1000)
+                  slotC.endTime = endT
+                  memE[key] = endT
+                else
+                  local endT = memE[key]
+                  if endT and endT > now then
+                    slotC.endTime = endT
+                  else
+                    slotC.endTime = nil
+                  end
+                end
+
+                -- Charges (stacks) follow the same "slot is currently enchanted" truth.
+                if info.tempEnchantmentCharges ~= nil then
+                  local ch = tonumber(info.tempEnchantmentCharges) or 0
+                  if ch < 0 then
+                    ch = 0
+                  end
+                  slotC.charges = ch
+                  memC[key] = ch
+                else
+                  local ch = memC[key]
+                  if ch == nil then
+                    ch = 0
+                  end
+                  slotC.charges = ch
+                end
+
+              else
+                -- No temp enchant on the CURRENTLY equipped weapon in this slot => clear display.
+                slotC.endTime = nil
+                slotC.tempEnchantId = nil
+                slotC.charges = 0
+              end
+            end
+          end
+
+          local remSec = 0
+          if slotC.endTime then
+            remSec = slotC.endTime - now
+            if remSec < 0 then
+              remSec = 0
+            end
+          end
+
+          -- If timer expired, charges are treated as expired too
+          if remSec <= 0 then
+            slotC.charges = 0
+          end
+
+          state.teRem = remSec
+          state.teCharges = slotC.charges or 0
+          state.teItemId = slotC.itemId
+          state.teEnchantId = slotC.tempEnchantId
+        end
       end
 
       -- Composite “equipped trinkets” synthetic entries
@@ -1433,12 +1582,31 @@ local function _EvaluateItemCoreState(data, c)
     -- No Whereabouts for synthetic entries; treat as pass
     state.passesWhere = true
 
-    -- for synthetic entries, treat "stack count" as 1 if an item exists
+	-- for synthetic entries, treat "stack count" as 1 if an item exists
     if state.hasItem then
-      state.eqCount = 1
-      state.bagCount = 0
-      state.totalCount = 1
-      state.effectiveCount = 1
+      -- Special case: equipped weapon slots can show temp enchant charges
+      if (invSlotName == "MAINHAND" or invSlotName == "OFFHAND" or invSlotName == "RANGED")
+          and data.displayName == "---EQUIPPED WEAPON SLOTS---"
+          and (c.textStackCounter == true or c.stacksEnabled == true) then
+
+        local ch = state.teCharges
+        if ch == nil then
+          ch = 0
+        end
+        if ch < 0 then
+          ch = 0
+        end
+
+        state.eqCount = ch
+        state.bagCount = 0
+        state.totalCount = ch
+        state.effectiveCount = ch
+      else
+        state.eqCount = 1
+        state.bagCount = 0
+        state.totalCount = 1
+        state.effectiveCount = 1
+      end
     else
       state.eqCount = 0
       state.bagCount = 0
@@ -1733,7 +1901,7 @@ _daCast:SetScript("OnEvent", function()
   _MarkSliderSeen(name)
 end)
 
--- Check class and register only the events we need for reactive procs
+-- Check class and register only the events player needs for reactive procs
 local _daClassCL = CreateFrame("Frame", "DoiteClassCL")
 local _daClassCL2 = CreateFrame("Frame", "DoiteClassCL2")
 
@@ -1744,6 +1912,7 @@ do
   if cls == "WARRIOR" then
     -- Overpower: needs dodge detection
     _daClassCL:RegisterEvent("CHAT_MSG_COMBAT_SELF_MISSES")
+	_daClassCL:RegisterEvent("CHAT_MSG_SPELL_SELF_DAMAGE")
 
     _daClassCL:SetScript("OnEvent", function()
       local line = arg1
@@ -1801,6 +1970,7 @@ do
   elseif cls == "ROGUE" then
     -- Surprise Attack: needs dodge detection
     _daClassCL:RegisterEvent("CHAT_MSG_COMBAT_SELF_MISSES")
+	_daClassCL:RegisterEvent("CHAT_MSG_SPELL_SELF_DAMAGE")
 
     _daClassCL:SetScript("OnEvent", function()
       local line = arg1
@@ -3090,11 +3260,21 @@ local function _PassesTargetUnitType(condTbl, unit)
       return true
     end
     return false
+
   elseif val == "NPC" then
     if UnitIsPlayer and UnitIsPlayer(unit) then
       return false
     end
     return true
+
+  elseif val == "Boss" then
+    -- UnitClassification(unit) returns: "worldboss", "rareelite", "elite", "rare" or "normal"
+    local cls = UnitClassification and UnitClassification(unit) or nil
+    if not cls or cls == "" then
+      -- No classification info; don't kill the icon
+      return true
+    end
+    return (cls == "worldboss")
   end
 
   local creatureType = UnitCreatureType and UnitCreatureType(unit) or nil
@@ -4305,6 +4485,43 @@ local function CheckAbilityConditions(data)
 
   local show = true
 
+  -- === Slider guard for cooldown slider preview ========================
+  -- The slider is allowed to "preview show" even when cooldown/usability would hide the icon, BUT it must still respect:
+  --   * form
+  --   * weaponFilter
+  --   * auraConditions
+  --
+  -- Cache the result on the data table so ApplyVisuals/_HandleAbilitySlider can suppress the slider without re-evaluating the whole ability logic.
+  data._daSliderGuard = nil
+  local _sgFormPass, _sgWeaponPass, _sgAuraPass = nil, nil, nil
+
+  if c.slider == true and (c.mode == "usable" or c.mode == "notcd") then
+    local okSlider = true
+
+    if c.form and c.form ~= "All" then
+      _sgFormPass = DoiteConditions_PassesFormRequirement(c.form) and true or false
+      if not _sgFormPass then
+        okSlider = false
+      end
+    end
+
+    if okSlider and c.weaponFilter and c.weaponFilter ~= "" then
+      _sgWeaponPass = DoiteConditions_PassesWeaponFilter(c) and true or false
+      if not _sgWeaponPass then
+        okSlider = false
+      end
+    end
+
+    if okSlider and c.auraConditions and table.getn(c.auraConditions) > 0 then
+      _sgAuraPass = DoiteConditions_EvaluateAuraConditionsList(c.auraConditions) and true or false
+      if not _sgAuraPass then
+        okSlider = false
+      end
+    end
+
+    data._daSliderGuard = okSlider and true or false
+  end
+
   -- === 1. Cooldown / usability ===
   local spellName = _GetCanonicalSpellNameFromData(data)
   local spellIndex = _GetSpellIndexByName(spellName)
@@ -4473,15 +4690,27 @@ local function CheckAbilityConditions(data)
 
   -- === Form / Stance requirement (if set)
   if show and c.form and c.form ~= "All" then
-    if not DoiteConditions_PassesFormRequirement(c.form) then
-      show = false
+    if _sgFormPass ~= nil then
+      if not _sgFormPass then
+        show = false
+      end
+    else
+      if not DoiteConditions_PassesFormRequirement(c.form) then
+        show = false
+      end
     end
   end
 
   -- === Weapon filter (Two-Hand / Shield / Dual-Wield) ===
   if show and c.weaponFilter and c.weaponFilter ~= "" then
-    if not DoiteConditions_PassesWeaponFilter(c) then
-      show = false
+    if _sgWeaponPass ~= nil then
+      if not _sgWeaponPass then
+        show = false
+      end
+    else
+      if not DoiteConditions_PassesWeaponFilter(c) then
+        show = false
+      end
     end
   end
 
@@ -4579,8 +4808,14 @@ local function CheckAbilityConditions(data)
 
   -- === Aura Conditions (extra ability gating) ===========================
   if show and c.auraConditions and table.getn(c.auraConditions) > 0 then
-    if not DoiteConditions_EvaluateAuraConditionsList(c.auraConditions) then
-      show = false
+    if _sgAuraPass ~= nil then
+      if not _sgAuraPass then
+        show = false
+      end
+    else
+      if not DoiteConditions_EvaluateAuraConditionsList(c.auraConditions) then
+        show = false
+      end
     end
   end
 
@@ -5467,14 +5702,28 @@ local function _Doite_UpdateOverlayForFrame(frame, key, dataTbl, slideActive)
         -- Reuse this later for stack counter too
         itemState = _EvaluateItemCoreState(dataTbl, ci)
 
-        local remItem = itemState and itemState.rem or nil
-        local durItem = itemState and itemState.dur or 0
+        -- Special case: equipped weapon slots + mode=notcd => show temp enchant remaining time
+        if (ci.mode == "notcd")
+            and (dataTbl.displayName == "---EQUIPPED WEAPON SLOTS---")
+            and (ci.inventorySlot == "MAINHAND" or ci.inventorySlot == "OFFHAND" or ci.inventorySlot == "RANGED") then
 
-        -- Ignore ultra-short junk cooldowns; only show real cooldowns
-        if remItem and remItem > 0 and durItem and durItem > 1.5 then
-          remText = _FmtRem(remItem)
-          wantRem = (remText ~= nil)
-          frame._daSortRem = remItem
+          local remTE = itemState and itemState.teRem or 0
+          if remTE and remTE > 0 then
+            remText = _FmtRem(remTE)
+            wantRem = (remText ~= nil)
+            frame._daSortRem = remTE
+          end
+
+        else
+          local remItem = itemState and itemState.rem or nil
+          local durItem = itemState and itemState.dur or 0
+
+          -- Ignore ultra-short junk cooldowns; only show real cooldowns
+          if remItem and remItem > 0 and durItem and durItem > 1.5 then
+            remText = _FmtRem(remItem)
+            wantRem = (remText ~= nil)
+            frame._daSortRem = remItem
+          end
         end
       end
 
@@ -5613,7 +5862,33 @@ local function _Doite_UpdateOverlayForFrame(frame, key, dataTbl, slideActive)
       end
 
       local cnt = state and state.effectiveCount or nil
-      if cnt and cnt >= 1 then
+
+      -- Special case: equipped weapon slots show temp enchant charges (including 0)
+      if (dataTbl.displayName == "---EQUIPPED WEAPON SLOTS---")
+          and (ci.inventorySlot == "MAINHAND" or ci.inventorySlot == "OFFHAND" or ci.inventorySlot == "RANGED") then
+
+        if not cnt then
+          cnt = 0
+        end
+        if cnt < 0 then
+          cnt = 0
+        end
+
+        local s = _DA_NumToStr(cnt)
+        if s ~= frame._daLastStacksText then
+          frame._daLastStacksText = s
+          frame._daTextStacks:SetText(s)
+          frame._daTextStacks:SetTextColor(1, 1, 1, 1)
+        end
+        -- Use larger size if showing stacks but not rem
+        local sizeToUse = (not wantRem and frame._daRemSize) or frame._daStackSize
+        if sizeToUse and sizeToUse ~= frame._daCurrentStackFontSize then
+          frame._daCurrentStackFontSize = sizeToUse
+          frame._daTextStacks:SetFont(GameFontNormalSmall:GetFont(), sizeToUse, "OUTLINE")
+        end
+        frame._daTextStacks:Show()
+
+      elseif cnt and cnt >= 1 then
         local s = _DA_NumToStr(cnt)
         if s ~= frame._daLastStacksText then
           frame._daLastStacksText = s
@@ -5633,7 +5908,7 @@ local function _Doite_UpdateOverlayForFrame(frame, key, dataTbl, slideActive)
 end
 
 -- Ability cooldown slider helper (reduces upvalues in ApplyVisuals)
-local function _HandleAbilitySlider(key, ca, dataTbl)
+local function _HandleAbilitySlider(key, ca, dataTbl, sliderGuardOk)
   -- Only for Ability icons in usable/notcd mode with slider enabled
   if not (key and ca and dataTbl) then
     if SlideMgr.active and SlideMgr.active[key] then
@@ -5644,6 +5919,17 @@ local function _HandleAbilitySlider(key, ca, dataTbl)
 
   if not (ca.slider and (ca.mode == "usable" or ca.mode == "notcd")) then
     -- Slider disabled for this icon: make sure it's stopped
+    local had = SlideMgr.active and SlideMgr.active[key]
+    if had then
+      SlideMgr:Stop(key)
+      return false, true, false, 0, 0, 1
+    end
+    SlideMgr:Stop(key)
+    return false, false, false, 0, 0, 1
+  end
+
+  -- Slider guard (form / weaponFilter / auraConditions) computed in CheckAbilityConditions
+  if sliderGuardOk == false then
     local had = SlideMgr.active and SlideMgr.active[key]
     if had then
       SlideMgr:Stop(key)
@@ -5819,7 +6105,7 @@ function DoiteConditions:ApplyVisuals(key, show, glow, grey)
     local startedSlide, stoppedSlide
 
     -- Lightweight wrapper: heavy logic lives in _HandleAbilitySlider
-    startedSlide, stoppedSlide, slideActive, dx, dy, slideAlpha = _HandleAbilitySlider(key, ca, dataTbl)
+    startedSlide, stoppedSlide, slideActive, dx, dy, slideAlpha = _HandleAbilitySlider(key, ca, dataTbl, dataTbl._daSliderGuard)
 
     -- === immediate group reflow on slide start/stop ===
     if (startedSlide or stoppedSlide) and DoiteGroup and DoiteGroup.ApplyGroupLayout then
@@ -5844,7 +6130,10 @@ function DoiteConditions:ApplyVisuals(key, show, glow, grey)
     -- 1) Always allow showing during slide (preview), like OLD code.
     allowSlideShow = false
     if slideActive and dataTbl and dataTbl.conditions and dataTbl.conditions.ability then
-      allowSlideShow = (dataTbl.conditions.ability.slider == true)
+      local ca = dataTbl.conditions.ability
+      if ca.slider == true and (dataTbl._daSliderGuard ~= false) then
+        allowSlideShow = true
+      end
     end
 
     -- 2) Default suppression during slide UNLESS slider is explicitly enabled.
@@ -6603,6 +6892,21 @@ eventFrame:SetScript("OnEvent", function()
       if _InvalidateItemScanCache then
         _InvalidateItemScanCache()
       end
+
+      -- Temp enchant tracking: force a refresh on next evaluation
+      local te = DoiteConditions._daTempEnchantCache
+      if te then
+        if te[INV_SLOT_MAINHAND] then
+          te[INV_SLOT_MAINHAND].t = 0
+        end
+        if te[INV_SLOT_OFFHAND] then
+          te[INV_SLOT_OFFHAND].t = 0
+        end
+        if te[INV_SLOT_RANGED] then
+          te[INV_SLOT_RANGED].t = 0
+        end
+      end
+
       dirty_ability = true
     end
   end

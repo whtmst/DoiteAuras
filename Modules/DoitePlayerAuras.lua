@@ -1,3 +1,9 @@
+---------------------------------------------------------------
+-- DoitePlayerAuras.lua
+-- Player aura cache + lookup helpers (buffs/debuffs, slot + stack counts)
+-- Please respect license note: Ask permission
+-- WoW 1.12 | Lua 5.0
+---------------------------------------------------------------
 local DoitePlayerAuras = {
   buffs = {},
   debuffs = {},

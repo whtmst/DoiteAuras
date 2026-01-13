@@ -1087,7 +1087,7 @@ local function DE_CreateExportFrame()
 
   local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
   title:SetPoint("TOPLEFT", f, "TOPLEFT", 20, -15)
-  title:SetText("Export")
+  title:SetText("|cff6FA8DCDoiteExport|r")
 
   local sep = f:CreateTexture(nil, "ARTWORK")
   sep:SetHeight(1)
@@ -1395,6 +1395,12 @@ function DoiteExport_ShowExportFrame()
     importFrame:Hide()
   end
 
+  -- If Settings is open, close it so only one is visible
+  local sf = _G["DoiteAurasSettingsFrame"]
+  if sf and sf.IsShown and sf:IsShown() then
+    sf:Hide()
+  end
+
   exportFrame:Show()
 end
 
@@ -1432,7 +1438,7 @@ local function DE_CreateImportFrame()
 
   local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
   title:SetPoint("TOPLEFT", f, "TOPLEFT", 20, -15)
-  title:SetText("Import")
+  title:SetText("|cff6FA8DCDoiteImport|r")
 
   local sep = f:CreateTexture(nil, "ARTWORK")
   sep:SetHeight(1)
@@ -1647,6 +1653,12 @@ function DoiteExport_ShowImportFrame()
   -- If the export frame is open, close it so only one is visible
   if exportFrame and exportFrame:IsShown() then
     exportFrame:Hide()
+  end
+
+  -- If Settings is open, close it so only one is visible
+  local sf = _G["DoiteAurasSettingsFrame"]
+  if sf and sf.IsShown and sf:IsShown() then
+    sf:Hide()
   end
 
   importFrame:Show()

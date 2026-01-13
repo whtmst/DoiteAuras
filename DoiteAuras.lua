@@ -276,7 +276,7 @@ frame:SetFrameStrata("FULLSCREEN_DIALOG")
 
 local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
 title:SetPoint("TOPLEFT", frame, "TOPLEFT", 20, -15)
-title:SetText("DoiteAuras")
+title:SetText("|cff6FA8DCDoiteAuras|r")
 
 local sep = frame:CreateTexture(nil, "ARTWORK")
 sep:SetHeight(1)
@@ -319,6 +319,22 @@ importBtn:SetScript("OnClick", function()
         DoiteExport_ShowImportFrame()
     else
         (DEFAULT_CHAT_FRAME or ChatFrame1):AddMessage("|cffff0000DoiteAuras:|r Export module not loaded.")
+    end
+end)
+
+-- Settings button
+local settingsBtn = CreateFrame("Button", "DoiteAurasSettingsButton", frame, "UIPanelButtonTemplate")
+settingsBtn:SetWidth(70)
+settingsBtn:SetHeight(20)
+settingsBtn:SetPoint("RIGHT", importBtn, "LEFT", -4, 0)
+settingsBtn:SetText("Settings")
+
+-- External call
+settingsBtn:SetScript("OnClick", function()
+    if DoiteAuras_ShowSettings then
+        DoiteAuras_ShowSettings()
+    else
+        (DEFAULT_CHAT_FRAME or ChatFrame1):AddMessage("|cff6FA8DCDoiteAuras:|r Settings module not loaded.")
     end
 end)
 
@@ -1072,6 +1088,20 @@ frame:SetScript("OnShow", function()
     if DA_RebuildAbilityDropDown then
         DA_RebuildAbilityDropDown()
     end
+end)
+
+frame:SetScript("OnHide", function()
+    -- Force-close Import / Export / Settings windows when the main DoiteAuras frame is hidden
+    local f
+
+    f = _G["DoiteAurasImportFrame"]
+    if f and f.Hide then f:Hide() end
+
+    f = _G["DoiteAurasExportFrame"]
+    if f and f.Hide then f:Hide() end
+
+    f = _G["DoiteAurasSettingsFrame"]
+    if f and f.Hide then f:Hide() end
 end)
 
 -- Scrollable container
@@ -2777,17 +2807,22 @@ local function DA_CreateMinimapButton()
       end
       return
     end
-	if DoiteAurasFrame and DoiteAurasFrame:IsShown() then
+
+    if DoiteAurasFrame and DoiteAurasFrame:IsShown() then
       DoiteAurasFrame:Hide()
     else
-	-- center-on-open logic (keeps Step #1 behavior)
-    if DoiteAurasFrame then
-     DoiteAurasFrame:ClearAllPoints()
-     DoiteAurasFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
-     DoiteAurasFrame:Show()
-		end
-	end
+      -- center-on-open logic (keeps Step #1 behavior)
+      if DoiteAurasFrame then
+        DoiteAurasFrame:ClearAllPoints()
+        DoiteAurasFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+        DoiteAurasFrame:Show()
+
+        -- IMPORTANT: /da calls RefreshList() on open; minimap must do the same
+        RefreshList()
+      end
+    end
   end)
+
 
   -- tooltip
   btn:SetScript("OnEnter", function()
@@ -2839,24 +2874,22 @@ SlashCmdList["DOITEAURAS"] = function(msg)
   rest = string.gsub(rest, "^%s+", "")
   rest = string.gsub(rest, "%s+$", "")
 
-  -- /da cleartimers [name/spellid]  or  /da ct [name/spellid]
-  if cmd == "cleartimers" or cmd == "ct" then
-    local clearFn = _G["DoiteTrack_ClearTimers"]
-    if type(clearFn) == "function" then
-      -- ""      -> clear all
-      -- "rend"  -> clear all ranks whose meta.name normalises to "rend"
-      -- "11574" -> clear only that spellId
-      clearFn(rest)
+  -- /da debug
+  if cmd == "debug" then
+    local fn = _G["DoiteTrack_SetNPDebug"]
+    if type(fn) == "function" then
+      local cur = (_G["DoiteTrack_NPDebug"] and true or false)
+      fn(not cur)
     else
       local cf = (DEFAULT_CHAT_FRAME or ChatFrame1)
       if cf then
-        cf:AddMessage("|cff6FA8DCDoiteAuras:|r Timer clear function not available (DoiteTrack not loaded?).")
+        cf:AddMessage("|cff6FA8DCDoiteAuras:|r debug toggle not available (DoiteTrack not loaded?).")
       end
     end
     return
   end
 
-  -- No /ct command -> normal DoiteAuras toggle
+  -- Normal DoiteAuras toggle
   if DA_IsHardDisabled() then
     local cf = (DEFAULT_CHAT_FRAME or ChatFrame1)
     if cf then
