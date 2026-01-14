@@ -2283,6 +2283,12 @@ local function _PlayerAuraRemainingSeconds(auraName)
     end
   end
 
+  -- get remaining for buff cap spells
+  local remaining = DoitePlayerAuras.GetHiddenBuffRemaining(auraName)
+  if remaining and remaining > 0 then
+    return remaining
+  end
+
   return nil
 end
 
@@ -2652,16 +2658,11 @@ local function _GetAuraStacksOnUnit(unit, auraName, wantDebuff)
 
   -- Use DoitePlayerAuras for player checks
   if unit == "player" then
-    local _, info
     if wantDebuff then
-      _, info = DoitePlayerAuras.GetDebuffInfo(auraName)
+      return DoitePlayerAuras.GetDebuffStacks(auraName)
     else
-      _, info = DoitePlayerAuras.GetBuffInfo(auraName)
+      return DoitePlayerAuras.GetBuffStacks(auraName)
     end
-    if info and info.stacks then
-      return info.stacks
-    end
-    return nil
   end
 
   -- TODO improve logic for other units
