@@ -288,10 +288,18 @@ if not DoitePlayerAuras.debugBuffCap then
 end
 BuffAddedFrame:SetScript("OnEvent", function()
   local unitSlot, spellId, stacks = arg2, arg3, arg4
-  DoitePlayerAuras.buffs[unitSlot].spellId = spellId
-  DoitePlayerAuras.buffs[unitSlot].stacks = stacks
-  MarkActive(spellId, DoitePlayerAuras.activeBuffs, unitSlot)
-  if unitSlot == MAX_BUFF_SLOTS then
+
+  -- some spells like auras will not use the last open slot and will push down other buffs, check for this
+  if DoitePlayerAuras.buffs[unitSlot].spellId then
+    UpdateBuffs()
+  else
+    DoitePlayerAuras.buffs[unitSlot].spellId = spellId
+    DoitePlayerAuras.buffs[unitSlot].stacks = stacks
+    MarkActive(spellId, DoitePlayerAuras.activeBuffs, unitSlot)
+  end
+
+  -- check if unit buff slot 32 is filled
+  if DoitePlayerAuras.buffs[MAX_BUFF_SLOTS].spellId then
     -- just hit buff cap, enable AURA_CAST event
     DoitePlayerAuras.RegisterBuffCapEvents()
   end
