@@ -1375,6 +1375,7 @@ local function DA_CleanupEmptyGroupAndCategory(groupName, categoryName)
         if DoiteAurasDB.bucketDisabled then
             DoiteAurasDB.bucketDisabled[groupName] = nil
         end
+        DoiteGroup.InvalidateSortCache(groupName)
     end
 
     -- If no icons left with this category: remove it from the global list
@@ -2321,6 +2322,7 @@ local function RefreshList()
                     if DoiteAurasDB.groupFixed then
                         DoiteAurasDB.groupFixed[p.groupName] = nil
                     end
+                    DoiteGroup.InvalidateSortCache(p.groupName)
                     _G["DoiteGroup_NeedReflow"] = true
                 end)
 
@@ -2342,6 +2344,7 @@ local function RefreshList()
                     if DoiteAurasDB.groupFixed then
                         DoiteAurasDB.groupFixed[p.groupName] = nil
                     end
+                    DoiteGroup.InvalidateSortCache(p.groupName)
                     _G["DoiteGroup_NeedReflow"] = true
                 end)
 

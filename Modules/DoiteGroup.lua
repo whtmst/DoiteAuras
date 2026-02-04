@@ -261,10 +261,11 @@ local function ComputeGroupLayout(entries, groupName)
         fixedKnown[an] = e
       end
       local f = _GetIconFrame(e.key)
-      -- Use frame flags; fall back to 'show'; finally fall back to "currently visible" to avoid races
+      -- Use frame flags; fall back to 'show' from candidates.
+      -- Only use IsShown() fallback if frame flags haven't been initialized yet (avoids blocking collapse).
       local wants = (f and (f._daShouldShow == true or f._daSliding == true))
           or (e.show == true)
-          or (f and f:IsShown())
+          or (f and f._daShouldShow == nil and f._daSliding == nil and f:IsShown())
 
       -- While editing, always include the edited member in the layout pool
       if editKey and e.key == editKey then
@@ -710,6 +711,20 @@ function DoiteGroup.RequestReflow()
   end
   DoiteGroup._reflowQueued = 1
   _watch:SetScript("OnUpdate", _RunReflowOnce)
+end
+
+-- Public API: invalidate cached sort mode for a group (call when sort mode changes)
+function DoiteGroup.InvalidateSortCache(groupName)
+  if DoiteGroup._sortCache then
+    if groupName then
+      DoiteGroup._sortCache[groupName] = nil
+    else
+      -- Clear entire cache if no group specified
+      for k in pairs(DoiteGroup._sortCache) do
+        DoiteGroup._sortCache[k] = nil
+      end
+    end
+  end
 end
 
 -- Internal helpers called by ApplyGroupLayout (Patch 1/2)
